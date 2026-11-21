@@ -34,6 +34,8 @@ systemctl --user status ags-android-capture.socket
 curl http://127.0.0.1:17653/healthz
 ```
 
+If the browser reports that it cannot reach the local capture service, the user socket is not listening on the computer running the browser. Re-run `./install.sh` (or `scripts/install-linux.sh` from a checkout), then check `systemctl --user status ags-android-capture.socket`. If `systemctl --user` reports that it cannot connect to the bus, log into a normal desktop session with a systemd user manager; in minimal/headless sessions, start the user manager before installing. A healthy `/healthz` response is `ok`.
+
 ## Windows
 
 The Windows output bundle includes `install.ps1`; run it from PowerShell after extracting the GitHub artifact. From a source checkout, run `scripts/install-windows.ps1`. It installs a per-user logon task for the loopback listener.

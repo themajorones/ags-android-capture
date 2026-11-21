@@ -37,6 +37,19 @@ EOF
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable --now ags-android-capture.socket
+if ! systemctl --user enable --now ags-android-capture.socket; then
+  cat >&2 <<'EOF'
+Could not start the AGS Android capture user socket.
+The browser error "Could not reach the local Android capture service" means
+127.0.0.1:17653 is not listening. Check that this Linux session has a working
+systemd user manager with: systemctl --user status
+EOF
+  exit 1
+fi
+if ! systemctl --user is-active --quiet ags-android-capture.socket; then
+  systemctl --user status --no-pager ags-android-capture.socket >&2 || true
+  echo "AGS Android capture socket did not become active." >&2
+  exit 1
+fi
 echo "Installed. The bridge process starts on a browser request; systemd keeps only its loopback socket listening."
 echo "Allowed web origins are in $HOME/.config/ags-android-capture/environment"
