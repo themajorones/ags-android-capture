@@ -84,16 +84,22 @@ if [[ -d "$TOOLS/platform-tools/lib64" ]]; then
   cp -a "$TOOLS/platform-tools/lib64" "$OUT/"
 fi
 
-# Bundle scrcpy's direct FFmpeg/SDL runtime libraries. The remaining OS
-# libraries are provided by the host Linux distribution.
+# Bundle scrcpy's non-core shared libraries recursively. The host provides
+# only the Linux loader and glibc itself.
 scrcpy_libdir="$(pkg-config --variable=libdir libavcodec)"
 build_ld_path="$scrcpy_libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-LD_LIBRARY_PATH="$build_ld_path" ldd "$OUT/scrcpy" | awk '$1 ~ /^lib(av|SDL3|oapv|swresample)/ && $3 ~ /^\// { print $3 }' | sort -u | while read -r source; do
+LD_LIBRARY_PATH="$build_ld_path" ldd "$OUT/scrcpy" | awk '$2 == "=>" && $3 ~ /^\// { print $3 }' | sort -u | while read -r source; do
   [[ -n "$source" ]] || continue
   soname="$(readelf -d "$source" | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p' | head -1)"
   [[ -n "$soname" ]] || soname="$(basename "$source")"
+  case "$soname" in
+    libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux*.so.*|libresolv.so.*|libutil.so.*|libnss_*.so.*) continue ;;
+  esac
   cp -L "$source" "$OUT/lib/$soname"
 done
+
+unresolved="$(LD_LIBRARY_PATH="$OUT/lib:$build_ld_path" ldd "$OUT/scrcpy" | grep 'not found' || true)"
+[[ -z "$unresolved" ]] || { echo "Unbundled scrcpy libraries remain:" >&2; echo "$unresolved" >&2; exit 1; }
 
 "$OUT/adb" version >/dev/null
 LD_LIBRARY_PATH="$OUT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$OUT/scrcpy" --version >/dev/null
