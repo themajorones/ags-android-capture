@@ -88,7 +88,7 @@ fi
 # libraries are provided by the host Linux distribution.
 scrcpy_libdir="$(pkg-config --variable=libdir libavcodec)"
 build_ld_path="$scrcpy_libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-LD_LIBRARY_PATH="$build_ld_path" ldd "$OUT/scrcpy" | awk '$1 ~ /^lib(av|SDL3|oapv)/ && $3 ~ /^\// { print $3 }' | sort -u | while read -r source; do
+LD_LIBRARY_PATH="$build_ld_path" ldd "$OUT/scrcpy" | awk '$1 ~ /^lib(av|SDL3|oapv|swresample)/ && $3 ~ /^\// { print $3 }' | sort -u | while read -r source; do
   [[ -n "$source" ]] || continue
   soname="$(readelf -d "$source" | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p' | head -1)"
   [[ -n "$soname" ]] || soname="$(basename "$source")"
