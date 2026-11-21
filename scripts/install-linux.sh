@@ -23,6 +23,33 @@ UNIT_DIR="$HOME/.config/systemd/user"
   exit 1
 }
 
+# Linux scrcpy is linked against the target machine's FFmpeg and SDL runtime.
+# Check the bundle before stopping/replacing a working installation so an
+# incompatible or incomplete artifact cannot leave the user without a bridge.
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Missing runtime requirement: FFmpeg. Install FFmpeg (including its runtime libraries), then run this installer again." >&2
+  exit 1
+fi
+if ! ffmpeg -version >/dev/null 2>&1; then
+  echo "FFmpeg is installed but could not start. Repair the FFmpeg runtime before installing the capture bridge." >&2
+  exit 1
+fi
+if ! command -v ldd >/dev/null 2>&1; then
+  echo "Missing installer requirement: ldd (provided by the system C runtime tools). Cannot verify scrcpy runtime libraries." >&2
+  exit 1
+fi
+SCRCPY_DEPS="$(ldd "$SOURCE/scrcpy" 2>&1)" || {
+  echo "Could not inspect the scrcpy runtime dependencies:" >&2
+  echo "$SCRCPY_DEPS" >&2
+  exit 1
+}
+if grep -q 'not found' <<<"$SCRCPY_DEPS"; then
+  echo "The scrcpy bundle is missing runtime libraries required by this system:" >&2
+  grep 'not found' <<<"$SCRCPY_DEPS" >&2
+  echo "Install the matching FFmpeg and SDL3 runtime packages, or rebuild the bundle on this Linux distribution." >&2
+  exit 1
+fi
+
 mkdir -p "$DEST" "$UNIT_DIR" "$HOME/.config/ags-android-capture" "$HOME/.android"
 systemctl --user stop ags-android-capture.socket ags-android-capture.service >/dev/null 2>&1 || true
 if [[ -d "$DEST/lib" ]]; then find "$DEST/lib" -mindepth 1 -maxdepth 1 -type f -delete; fi
