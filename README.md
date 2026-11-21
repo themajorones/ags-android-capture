@@ -1,0 +1,41 @@
+# AGS Android Capture
+
+A local browser bridge for Android Game View. It runs the packaged ADB and a patched scrcpy client on the browser's computer, then sends the encoded H.264 packets directly to the page over loopback WebSocket. It does not open a desktop video window or relay video through the AGS server.
+
+## Build
+
+Initialize the pinned sources, then run the platform build script:
+
+```sh
+git submodule update --init --recursive
+./scripts/build-linux.sh
+```
+
+Linux builds need Go, Meson, Ninja, pkg-config, a C compiler, FFmpeg development libraries, and SDL3 development files. Windows builds run from an MSYS2 MINGW64 shell and are also built by `.github/workflows/build.yml`.
+
+The build downloads pinned official releases of scrcpy's matching Android server and Google Android Platform Tools, verifies SHA-256, and packages ADB plus the server with the bridge. Source pins and the local scrcpy patch are kept in this repository.
+
+## Linux user service
+
+After building:
+
+```sh
+./scripts/install-linux.sh
+```
+
+The user socket listens only on `127.0.0.1:17653`. systemd starts the bridge when the browser connects; the bridge exits after one minute without a stream. The per-user socket stays ready for the next request. Set the exact AGS page origins allowed to connect in `~/.config/ags-android-capture/environment`, then restart the socket if you change the listener configuration.
+
+Check it with:
+
+```sh
+systemctl --user status ags-android-capture.socket
+curl http://127.0.0.1:17653/healthz
+```
+
+## Windows
+
+Build the Windows artifact in MSYS2 MINGW64, then run `scripts/install-windows.ps1` from PowerShell. It installs a per-user logon task for the loopback listener. ADB and scrcpy children start only when Game View requests a stream.
+
+## Browser behavior
+
+The AGS page requests `ws://127.0.0.1:17653/v1/stream` with the selected ADB serial, bitrate, and FPS. The bridge checks the exact browser `Origin`, allows one active stream, and rejects non-loopback listeners. ADB uses a separate private local ADB server for the stream, leaving the machine's normal ADB server untouched.

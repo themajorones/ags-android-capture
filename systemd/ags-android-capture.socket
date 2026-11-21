@@ -1,0 +1,10 @@
+[Unit]
+Description=AGS local Android capture socket
+
+[Socket]
+ListenStream=127.0.0.1:17653
+NoDelay=true
+Backlog=8
+
+[Install]
+WantedBy=sockets.target

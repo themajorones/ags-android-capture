@@ -1,0 +1,647 @@
+diff --git a/app/meson.build b/app/meson.build
+index 1c2021a85143b1c6677f539432d255e4ccc5c24c..edbbe5d487b765a30058c554e39e2356e2e968dd 100644
+--- a/app/meson.build
++++ b/app/meson.build
+@@ -4,6 +4,7 @@ src = [
+     'src/adb/adb_device.c',
+     'src/adb/adb_parser.c',
+     'src/adb/adb_tunnel.c',
++    'src/ags_stream_sink.c',
+     'src/audio_player.c',
+     'src/audio_regulator.c',
+     'src/cli.c',
+diff --git a/app/src/ags_stream_sink.c b/app/src/ags_stream_sink.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..01bacfc1fed3d566f72d44e6ebe8dedae72b6721
+--- /dev/null
++++ b/app/src/ags_stream_sink.c
+@@ -0,0 +1,188 @@
++#include "ags_stream_sink.h"
++
++#include <errno.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifdef _WIN32
++# include <fcntl.h>
++# include <io.h>
++#endif
++
++#include "control_msg.h"
++#include "controller.h"
++#include "util/binary.h"
++#include "util/log.h"
++
++#define DOWNCAST(SINK) container_of(SINK, struct sc_ags_stream_sink, packet_sink)
++#define SC_AGSC_HEADER_SIZE 12
++#define SC_VIDEO_PACKET_HEADER_SIZE 12
++#define SC_VIDEO_PTS_MASK ((UINT64_C(1) << 61) - 1)
++#define SC_VIDEO_CONFIG_FLAG (UINT64_C(1) << 62)
++#define SC_VIDEO_KEY_FRAME_FLAG (UINT64_C(1) << 61)
++
++static bool
++write_bytes(const void *data, size_t size) {
++    if (fwrite(data, 1, size, stdout) != size) {
++        LOGE("Could not write AGS browser video stream");
++        return false;
++    }
++    return true;
++}
++
++static bool
++write_session(uint32_t width, uint32_t height, bool client_resized) {
++    uint8_t header[SC_VIDEO_PACKET_HEADER_SIZE] = {0};
++    header[0] = 0x80 | (client_resized ? 1 : 0);
++    sc_write32be(&header[4], width);
++    sc_write32be(&header[8], height);
++    return write_bytes(header, sizeof(header));
++}
++
++static bool
++ags_video_packet_sink_open(struct sc_packet_sink *packet_sink,
++                           const AVCodecParameters *params,
++                           const struct sc_stream_session *session) {
++    (void) params;
++    struct sc_ags_stream_sink *sink = DOWNCAST(packet_sink);
++    (void) sink;
++
++    if (!session || !session->video.width || !session->video.height) {
++        LOGE("Invalid video dimensions for AGS browser stream");
++        return false;
++    }
++
++    uint8_t metadata[SC_AGSC_HEADER_SIZE] = {'A', 'G', 'S', 'C'};
++    sc_write32be(&metadata[4], session->video.width);
++    sc_write32be(&metadata[8], session->video.height);
++    return write_bytes(metadata, sizeof(metadata))
++        && write_session(session->video.width, session->video.height,
++                         session->video.client_resized)
++        && fflush(stdout) == 0;
++}
++
++static void
++ags_video_packet_sink_close(struct sc_packet_sink *packet_sink) {
++    (void) packet_sink;
++    fflush(stdout);
++}
++
++static enum sc_sink_result
++ags_video_packet_sink_push(struct sc_packet_sink *packet_sink,
++                           const AVPacket *packet) {
++    (void) packet_sink;
++    if (packet->size <= 0) {
++        return SC_SINK_KO;
++    }
++
++    uint64_t pts_flags;
++    if (packet->pts == AV_NOPTS_VALUE) {
++        pts_flags = SC_VIDEO_CONFIG_FLAG;
++    } else {
++        pts_flags = (uint64_t) packet->pts & SC_VIDEO_PTS_MASK;
++        if (packet->flags & AV_PKT_FLAG_KEY) {
++            pts_flags |= SC_VIDEO_KEY_FRAME_FLAG;
++        }
++    }
++
++    uint8_t header[SC_VIDEO_PACKET_HEADER_SIZE];
++    sc_write64be(header, pts_flags);
++    sc_write32be(&header[8], (uint32_t) packet->size);
++    if (!write_bytes(header, sizeof(header))
++            || !write_bytes(packet->data, (size_t) packet->size)
++            || fflush(stdout) != 0) {
++        return SC_SINK_KO;
++    }
++    return SC_SINK_OK;
++}
++
++static enum sc_sink_result
++ags_video_packet_sink_push_session(struct sc_packet_sink *packet_sink,
++                                   const struct sc_stream_session *session) {
++    (void) packet_sink;
++    return write_session(session->video.width, session->video.height,
++                         session->video.client_resized)
++        && fflush(stdout) == 0
++         ? SC_SINK_OK : SC_SINK_KO;
++}
++
++static bool
++read_exact(void *data, size_t size) {
++    uint8_t *cursor = data;
++    while (size) {
++        size_t count = fread(cursor, 1, size, stdin);
++        if (!count) {
++            return false;
++        }
++        cursor += count;
++        size -= count;
++    }
++    return true;
++}
++
++static int
++run_input(void *data) {
++    struct sc_ags_stream_sink *sink = data;
++    uint8_t size_bytes[4];
++    for (;;) {
++        if (!read_exact(size_bytes, sizeof(size_bytes))) {
++            return 0;
++        }
++        uint32_t size = sc_read32be(size_bytes);
++        if (!size || size > SC_CONTROL_MSG_MAX_SIZE) {
++            LOGE("Invalid AGS browser control packet size: %" PRIu32, size);
++            return -1;
++        }
++
++        uint8_t *packet = malloc(size);
++        if (!packet) {
++            LOG_OOM();
++            return -1;
++        }
++        bool ok = read_exact(packet, size);
++        if (ok) {
++            ok = sc_controller_push_raw(sink->controller, packet, size);
++        }
++        free(packet);
++        if (!ok) {
++            if (!feof(stdin)) {
++                LOGE("Could not queue AGS browser control packet");
++                return -1;
++            }
++            return 0;
++        }
++    }
++}
++
++void
++sc_ags_stream_sink_init(struct sc_ags_stream_sink *sink) {
++    static const struct sc_packet_sink_ops ops = {
++        .open = ags_video_packet_sink_open,
++        .close = ags_video_packet_sink_close,
++        .push = ags_video_packet_sink_push,
++        .push_session = ags_video_packet_sink_push_session,
++    };
++
++    sink->packet_sink.ops = &ops;
++    sink->controller = NULL;
++    sink->input_started = false;
++
++#ifdef _WIN32
++    _setmode(_fileno(stdin), _O_BINARY);
++    _setmode(_fileno(stdout), _O_BINARY);
++#endif
++}
++
++bool
++sc_ags_stream_sink_start_input(struct sc_ags_stream_sink *sink,
++                               struct sc_controller *controller) {
++    sink->controller = controller;
++    if (!sc_thread_create(&sink->input_thread, run_input, "ags-stream-input",
++                          sink)) {
++        LOGE("Could not start AGS browser control reader");
++        return false;
++    }
++    sink->input_started = true;
++    return true;
++}
+diff --git a/app/src/ags_stream_sink.h b/app/src/ags_stream_sink.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6d6d9a6ef6c1f68938cf4ccd652305f92106fb1
+--- /dev/null
++++ b/app/src/ags_stream_sink.h
+@@ -0,0 +1,23 @@
++#ifndef SC_AGS_STREAM_SINK_H
++#define SC_AGS_STREAM_SINK_H
++
++#include "trait/packet_sink.h"
++#include "util/thread.h"
++
++struct sc_controller;
++
++struct sc_ags_stream_sink {
++    struct sc_packet_sink packet_sink;
++    struct sc_controller *controller;
++    sc_thread input_thread;
++    bool input_started;
++};
++
++void
++sc_ags_stream_sink_init(struct sc_ags_stream_sink *sink);
++
++bool
++sc_ags_stream_sink_start_input(struct sc_ags_stream_sink *sink,
++                               struct sc_controller *controller);
++
++#endif
+diff --git a/app/src/cli.c b/app/src/cli.c
+index c751ec860efd357eb6d4111e6268ab75a474f02b..84cb3f34a5412750624d3ac67636cf26419def5a 100644
+--- a/app/src/cli.c
++++ b/app/src/cli.c
+@@ -112,6 +112,7 @@ enum {
+     OPT_IGNORE_VIDEO_ENCODER_CONSTRAINTS,
+     OPT_NO_TERMINAL_TITLE,
+     OPT_HWDEC,
++    OPT_AGS_BROWSER_STREAM,
+ };
+ 
+ struct sc_option {
+@@ -715,6 +716,11 @@ static const struct sc_option options[] = {
+         .longopt = "no-window",
+         .text = "Disable scrcpy window. Implies --no-video-playback.",
+     },
++    {
++        .longopt_id = OPT_AGS_BROWSER_STREAM,
++        .longopt = "ags-browser-stream",
++        .text = "Write encoded video packets to stdout and read control packets from stdin for the AGS browser bridge.",
++    },
+     {
+         .longopt_id = OPT_NO_WINDOW_ASPECT_RATIO_LOCK,
+         .longopt = "no-window-aspect-ratio-lock",
+@@ -2936,6 +2942,9 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
+             case OPT_NO_WINDOW:
+                 opts->window = false;
+                 break;
++            case OPT_AGS_BROWSER_STREAM:
++                opts->ags_browser_stream = true;
++                break;
+             case OPT_AUDIO_DUP:
+                 opts->audio_dup = true;
+                 break;
+@@ -3065,7 +3074,7 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
+     }
+ 
+     if (opts->video && !opts->video_playback && !opts->record_filename
+-            && !v4l2) {
++            && !v4l2 && !opts->ags_browser_stream) {
+         LOGI("No video playback, no recording, no V4L2 sink: video disabled");
+         opts->video = false;
+     }
+@@ -3080,6 +3089,11 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
+         return false;
+     }
+ 
++    if (opts->ags_browser_stream && (!opts->video || !opts->control)) {
++        LOGE("--ags-browser-stream requires video and control");
++        return false;
++    }
++
+     if (!opts->video && !otg) {
+         // If video is disabled, then scrcpy must exit on audio failure.
+         opts->require_audio = true;
+diff --git a/app/src/control_msg.c b/app/src/control_msg.c
+index b75b6e75c92a9e2c36b7aed0a752d6279cef980f..4264c1b75f48d4b76044efd9168b13bba4a6410a 100644
+--- a/app/src/control_msg.c
++++ b/app/src/control_msg.c
+@@ -349,6 +349,9 @@ sc_control_msg_log(const struct sc_control_msg *msg) {
+         case SC_CONTROL_MSG_TYPE_SCAN_FILE:
+             LOG_CMSG("scan file \"%s\"", msg->scan_file.path);
+             break;
++        case SC_CONTROL_MSG_TYPE_RAW:
++            LOG_CMSG("browser input packet (%zu bytes)", msg->raw.size);
++            break;
+         default:
+             LOG_CMSG("unknown type: %u", (unsigned) msg->type);
+             break;
+@@ -362,7 +365,8 @@ sc_control_msg_is_droppable(const struct sc_control_msg *msg) {
+     // Cannot drop UHID_DESTROY messages either, because a further UHID_CREATE
+     // with the same id may fail.
+     return msg->type != SC_CONTROL_MSG_TYPE_UHID_CREATE
+-        && msg->type != SC_CONTROL_MSG_TYPE_UHID_DESTROY;
++        && msg->type != SC_CONTROL_MSG_TYPE_UHID_DESTROY
++        && msg->type != SC_CONTROL_MSG_TYPE_RAW;
+ }
+ 
+ void
+@@ -380,6 +384,9 @@ sc_control_msg_destroy(struct sc_control_msg *msg) {
+         case SC_CONTROL_MSG_TYPE_SCAN_FILE:
+             free(msg->scan_file.path);
+             break;
++        case SC_CONTROL_MSG_TYPE_RAW:
++            free(msg->raw.data);
++            break;
+         default:
+             // do nothing
+             break;
+diff --git a/app/src/control_msg.h b/app/src/control_msg.h
+index 1cf1564d3bf79cd7d0f5e4c8a44576a4e6d6413e..90ce3a42236cce6b5381c52fe571a37aec300d9c 100644
+--- a/app/src/control_msg.h
++++ b/app/src/control_msg.h
+@@ -50,6 +50,7 @@ enum sc_control_msg_type {
+     SC_CONTROL_MSG_TYPE_CAMERA_ZOOM_OUT,
+     SC_CONTROL_MSG_TYPE_RESIZE_DISPLAY,
+     SC_CONTROL_MSG_TYPE_SCAN_FILE,
++    SC_CONTROL_MSG_TYPE_RAW,
+ };
+ 
+ enum sc_copy_key {
+@@ -128,6 +129,10 @@ struct sc_control_msg {
+         struct {
+             char *path; // owned, to be freed by free()
+         } scan_file;
++        struct {
++            uint8_t *data; // owned, complete serialized scrcpy control packet
++            size_t size;
++        } raw;
+     };
+ };
+ 
+diff --git a/app/src/controller.c b/app/src/controller.c
+index 19e2acb860e5d0d904cae94752285412fae55133..ea8b0b0b6b9178b3abf4df94271b422e661e8b6d 100644
+--- a/app/src/controller.c
++++ b/app/src/controller.c
+@@ -1,6 +1,8 @@
+ #include "controller.h"
+ 
+ #include <assert.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "util/log.h"
+ 
+@@ -125,6 +127,30 @@ sc_controller_push_msg(struct sc_controller *controller,
+     return pushed;
+ }
+ 
++bool
++sc_controller_push_raw(struct sc_controller *controller,
++                       const uint8_t *data, size_t size) {
++    if (!size || size > SC_CONTROL_MSG_MAX_SIZE) {
++        return false;
++    }
++
++    uint8_t *copy = malloc(size);
++    if (!copy) {
++        return false;
++    }
++    memcpy(copy, data, size);
++
++    struct sc_control_msg msg = {
++        .type = SC_CONTROL_MSG_TYPE_RAW,
++        .raw = { .data = copy, .size = size },
++    };
++    if (!sc_controller_push_msg(controller, &msg)) {
++        free(copy);
++        return false;
++    }
++    return true;
++}
++
+ void
+ sc_controller_resize_display(struct sc_controller *controller,
+                              uint16_t width, uint16_t height) {
+@@ -142,6 +168,16 @@ sc_controller_resize_display(struct sc_controller *controller,
+ static bool
+ process_msg(struct sc_controller *controller,
+             const struct sc_control_msg *msg, bool *eos) {
++    if (msg->type == SC_CONTROL_MSG_TYPE_RAW) {
++        ssize_t w = net_send_all(controller->control_socket, msg->raw.data,
++                                 msg->raw.size);
++        if ((size_t) w != msg->raw.size) {
++            *eos = true;
++            return false;
++        }
++        return true;
++    }
++
+     static uint8_t serialized_msg[SC_CONTROL_MSG_MAX_SIZE];
+     size_t length = sc_control_msg_serialize(msg, serialized_msg);
+     if (!length) {
+diff --git a/app/src/controller.h b/app/src/controller.h
+index 888882561135b9d792d77f7db5794381ca98c38a..69412cf8f473fb4e36a8555ef813f30fd5cb323f 100644
+--- a/app/src/controller.h
++++ b/app/src/controller.h
+@@ -68,6 +68,10 @@ bool
+ sc_controller_push_msg(struct sc_controller *controller,
+                        const struct sc_control_msg *msg);
+ 
++bool
++sc_controller_push_raw(struct sc_controller *controller,
++                       const uint8_t *data, size_t size);
++
+ void
+ sc_controller_resize_display(struct sc_controller *controller,
+                              uint16_t width, uint16_t height);
+diff --git a/app/src/main.c b/app/src/main.c
+index 89d78299c1619784c2d85b0d1dd07c491f3869a9..f236d7edabfb92214d38759b70610cc7adcfc1a9 100644
+--- a/app/src/main.c
++++ b/app/src/main.c
+@@ -33,9 +33,6 @@ main_scrcpy(int argc, char *argv[]) {
+     setbuf(stderr, NULL);
+ #endif
+ 
+-    printf("scrcpy " SCRCPY_VERSION
+-           " <https://github.com/Genymobile/scrcpy>\n");
+-
+     struct scrcpy_cli_args args = {
+         .opts = scrcpy_options_default,
+         .help = false,
+@@ -56,6 +53,13 @@ main_scrcpy(int argc, char *argv[]) {
+         goto end;
+     }
+ 
++    // stdout is a binary stream in AGS browser mode. Keep the normal version
++    // banner for interactive and diagnostic invocations only.
++    if (!args.opts.ags_browser_stream) {
++        printf("scrcpy " SCRCPY_VERSION
++               " <https://github.com/Genymobile/scrcpy>\n");
++    }
++
+     sc_set_log_level(args.opts.log_level);
+ 
+     if (args.opts.update_terminal_title) {
+@@ -87,7 +91,7 @@ main_scrcpy(int argc, char *argv[]) {
+         goto end;
+     }
+ 
+-    sc_log_configure();
++    sc_log_configure(args.opts.ags_browser_stream);
+ 
+     if (!sc_main_thread_init()) {
+         ret = SCRCPY_EXIT_FAILURE;
+diff --git a/app/src/options.c b/app/src/options.c
+index 97b23decb8d158b751dc5bccd258d280039f2ef9..58c7a646bc1732db6fe36ae7f95452141be0f35f 100644
+--- a/app/src/options.c
++++ b/app/src/options.c
+@@ -124,6 +124,7 @@ const struct scrcpy_options scrcpy_options_default = {
+     .flex_display = false,
+     .ignore_video_encoder_constraints = false,
+     .update_terminal_title = true,
++    .ags_browser_stream = false,
+ };
+ 
+ enum sc_orientation
+diff --git a/app/src/options.h b/app/src/options.h
+index 1eba9a8050172f3f2acf7a8654d507a439951af1..0782204c49d88d71ab6f603874d76e36fb950c63 100644
+--- a/app/src/options.h
++++ b/app/src/options.h
+@@ -373,6 +373,7 @@ struct scrcpy_options {
+     bool flex_display;
+     bool ignore_video_encoder_constraints;
+     bool update_terminal_title;
++    bool ags_browser_stream;
+ };
+ 
+ extern const struct scrcpy_options scrcpy_options_default;
+diff --git a/app/src/scrcpy.c b/app/src/scrcpy.c
+index 0967e5dab2614dc030b4ef922e940318e1a1600f..47a6e5be65a22733f9881c660adcad51070f0ffb 100644
+--- a/app/src/scrcpy.c
++++ b/app/src/scrcpy.c
+@@ -15,6 +15,7 @@
+ #endif
+ 
+ #include "audio_player.h"
++#include "ags_stream_sink.h"
+ #include "controller.h"
+ #include "decoder.h"
+ #include "demuxer.h"
+@@ -61,6 +62,7 @@ struct scrcpy {
+     struct sc_decoder audio_decoder;
+     struct sc_hwdec hwdec;
+     struct sc_recorder recorder;
++    struct sc_ags_stream_sink ags_stream_sink;
+     struct sc_video_regulator video_regulator;
+ #ifdef HAVE_V4L2
+     struct sc_v4l2_sink v4l2_sink;
+@@ -450,6 +452,7 @@ scrcpy(struct scrcpy_options *options) {
+         .capture_orientation = options->capture_orientation,
+         .capture_orientation_lock = options->capture_orientation_lock,
+         .control = options->control,
++        .ags_browser_stream = options->ags_browser_stream,
+         .display_id = options->display_id,
+         .new_display = options->new_display,
+         .display_ime_policy = options->display_ime_policy,
+@@ -607,6 +610,12 @@ scrcpy(struct scrcpy_options *options) {
+                         set_recv_date, &video_demuxer_cbs, NULL);
+     }
+ 
++    if (options->ags_browser_stream) {
++        sc_ags_stream_sink_init(&s->ags_stream_sink);
++        sc_packet_source_add_sink(&s->video_demuxer.packet_source,
++                                  &s->ags_stream_sink.packet_sink);
++    }
++
+     if (options->audio) {
+         static const struct sc_demuxer_callbacks audio_demuxer_cbs = {
+             .on_ended = sc_audio_demuxer_on_ended,
+@@ -807,6 +816,13 @@ aoa_complete:
+             goto end;
+         }
+         controller_started = true;
++
++        if (options->ags_browser_stream
++                && !sc_ags_stream_sink_start_input(&s->ags_stream_sink,
++                                                   &s->controller)) {
++            LOGE("Could not start AGS browser input reader");
++            goto end;
++        }
+     }
+ 
+     // There is a controller if and only if control is enabled
+diff --git a/app/src/server.c b/app/src/server.c
+index 335ee62c1dcfc4e48f11b7f717e80be96ab7b9b3..becd3a6a3ab0d2379ae0ad165201d27b8ab93337 100644
+--- a/app/src/server.c
++++ b/app/src/server.c
+@@ -54,7 +54,7 @@ get_server_path(void) {
+ }
+ 
+ static bool
+-push_server(struct sc_intr *intr, const char *serial) {
++push_server(struct sc_intr *intr, const char *serial, bool quiet) {
+     char *server_path = get_server_path();
+     if (!server_path) {
+         return false;
+@@ -64,7 +64,9 @@ push_server(struct sc_intr *intr, const char *serial) {
+         free(server_path);
+         return false;
+     }
+-    bool ok = sc_adb_push(intr, serial, server_path, SC_DEVICE_SERVER_PATH, 0);
++    unsigned flags = quiet ? SC_ADB_NO_STDOUT : 0;
++    bool ok = sc_adb_push(intr, serial, server_path, SC_DEVICE_SERVER_PATH,
++                          flags);
+     free(server_path);
+     return ok;
+ }
+@@ -475,8 +477,12 @@ execute_server(struct sc_server *server,
+     //     Port: 5005
+     // Then click on "Debug"
+ #endif
+-    // Inherit both stdout and stderr (all server logs are printed to stdout)
+-    pid = sc_adb_execute(cmd, 0);
++    // In browser-stream mode, stdout is reserved for the binary H.264 stream.
++    // The Android server writes its diagnostic logs to stdout, so inheriting
++    // it would corrupt the stream preamble before the first video packet.
++    // Keep the normal console behavior for interactive scrcpy sessions.
++    unsigned adb_flags = params->ags_browser_stream ? SC_ADB_NO_STDOUT : 0;
++    pid = sc_adb_execute(cmd, adb_flags);
+ 
+ end:
+     for (unsigned i = dyn_idx; i < count; ++i) {
+@@ -1052,7 +1058,8 @@ run_server(void *data) {
+     assert(serial);
+     LOGD("Device serial: %s", serial);
+ 
+-    ok = push_server(&server->intr, serial);
++    ok = push_server(&server->intr, serial,
++                     server->params.ags_browser_stream);
+     if (!ok) {
+         goto error_connection_failed;
+     }
+diff --git a/app/src/server.h b/app/src/server.h
+index 956a8844c2a33036f30187293bd557f63e28aa82..8eb5c64002fbe38fc5e0ed052b430bc4e12ac57c 100644
+--- a/app/src/server.h
++++ b/app/src/server.h
+@@ -50,6 +50,7 @@ struct sc_server_params {
+     enum sc_orientation capture_orientation;
+     enum sc_orientation_lock capture_orientation_lock;
+     bool control;
++    bool ags_browser_stream;
+     uint32_t display_id;
+     const char *new_display;
+     enum sc_display_ime_policy display_ime_policy;
+diff --git a/app/src/util/log.c b/app/src/util/log.c
+index 470f1e674e9b4be856746ee165b7820529d85437..26b4d0fee8012cbffd554cf1ae287b8db916e0c4 100644
+--- a/app/src/util/log.c
++++ b/app/src/util/log.c
+@@ -137,24 +137,28 @@ static const char *const sc_sdl_log_priority_names[SDL_LOG_PRIORITY_COUNT] = {
+     [SDL_LOG_PRIORITY_CRITICAL] = "CRITICAL",
+ };
+ 
++static bool sc_binary_stdout;
++
+ static void SDLCALL
+ sc_sdl_log_print(void *userdata, int category, SDL_LogPriority priority,
+                  const char *message) {
+     (void) userdata;
+     (void) category;
+ 
+-    FILE *out = priority < SDL_LOG_PRIORITY_WARN ? stdout : stderr;
++    FILE *out = priority < SDL_LOG_PRIORITY_WARN && !sc_binary_stdout
++              ? stdout : stderr;
+     assert(priority < SDL_LOG_PRIORITY_COUNT);
+     const char *prio_name = sc_sdl_log_priority_names[priority];
+     fprintf(out, "%s: %s\n", prio_name, message);
+ }
+ 
+ void
+-sc_log_configure(void) {
++sc_log_configure(bool binary_stdout) {
+ #ifdef _WIN32
+     SetConsoleOutputCP(CP_UTF8);
+ #endif
+ 
++    sc_binary_stdout = binary_stdout;
+     SDL_SetLogOutputFunction(sc_sdl_log_print, NULL);
+     // Redirect FFmpeg logs to SDL logs
+     av_log_set_callback(sc_av_log_callback);
+diff --git a/app/src/util/log.h b/app/src/util/log.h
+index 02606cb46409808c63b901218eca39d192fa686e..48ddb476f2595313dd471cb04e96c5abee1b72b2 100644
+--- a/app/src/util/log.h
++++ b/app/src/util/log.h
+@@ -36,6 +36,6 @@ sc_log_windows_error(const char *prefix, int error);
+ #endif
+ 
+ void
+-sc_log_configure(void);
++sc_log_configure(bool binary_stdout);
+ 
+ #endif

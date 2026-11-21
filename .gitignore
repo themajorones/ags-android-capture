@@ -1,0 +1,17 @@
+.build/
+dist/
+*.log
+*.tmp
+.idea/
+.vscode/
+vendor/
+
+# Go and native build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Local service state
+capture.pid
+capture.log
