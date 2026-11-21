@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -43,7 +44,7 @@ func main() {
 		}
 		_ = os.Setenv("LD_LIBRARY_PATH", libraryPath)
 	}
-	adbPath := envOr("AGS_CAPTURE_ADB", filepath.Join(assetDir, exeName("adb")))
+	adbPath := envOr("AGS_CAPTURE_ADB", systemOrBundledADB(assetDir))
 	scrcpyPath := envOr("AGS_CAPTURE_SCRCPY", filepath.Join(assetDir, exeName("scrcpy")))
 	allowedOrigins := splitList(os.Getenv("AGS_CAPTURE_ALLOWED_ORIGINS"))
 	if len(allowedOrigins) == 0 {
@@ -88,6 +89,13 @@ func main() {
 	if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func systemOrBundledADB(assetDir string) string {
+	if path, err := exec.LookPath("adb"); err == nil {
+		return path
+	}
+	return filepath.Join(assetDir, exeName("adb"))
 }
 
 func getListener(address string, systemd bool) (net.Listener, error) {

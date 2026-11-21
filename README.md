@@ -17,11 +17,13 @@ The build downloads pinned official releases of scrcpy's matching Android server
 
 ## Linux user service
 
-After building:
+After building, the output bundle includes an installer. For a downloaded GitHub artifact, extract it and run:
 
 ```sh
-./scripts/install-linux.sh
+./install.sh
 ```
+
+When installing from a source checkout, run `./scripts/install-linux.sh` instead. The installer uses system `adb` when it is on `PATH`; otherwise it uses the bundled copy.
 
 The user socket listens only on `127.0.0.1:17653`. systemd starts the bridge when the browser connects; the bridge exits after one minute without a stream. The per-user socket stays ready for the next request. Set the exact AGS page origins allowed to connect in `~/.config/ags-android-capture/environment`, then restart the socket if you change the listener configuration.
 
@@ -34,7 +36,7 @@ curl http://127.0.0.1:17653/healthz
 
 ## Windows
 
-Build the Windows artifact in MSYS2 MINGW64, then run `scripts/install-windows.ps1` from PowerShell. It installs a per-user logon task for the loopback listener. ADB and scrcpy children start only when Game View requests a stream.
+The Windows output bundle includes `install.ps1`; run it from PowerShell after extracting the GitHub artifact. From a source checkout, run `scripts/install-windows.ps1`. It installs a per-user logon task for the loopback listener.
 
 ## Browser behavior
 

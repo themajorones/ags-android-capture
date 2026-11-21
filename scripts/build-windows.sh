@@ -70,4 +70,6 @@ ldd "$OUT/scrcpy.exe" | awk '$3 ~ /^\/mingw64\/bin\/.*\.dll$/ { print $3 }' | so
 done
 
 "$OUT/ags-android-capture.exe" 2>&1 | grep -q '^usage:' || true
+cp "$ROOT/scripts/install-windows.ps1" "$OUT/install.ps1"
+cp "$ROOT/README.md" "$OUT/README.md"
 echo "Windows bundle built at $OUT"

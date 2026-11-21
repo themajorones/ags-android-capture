@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOURCE="$ROOT/dist/linux-x86_64"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -x "$SCRIPT_DIR/ags-android-capture" ]]; then
+  SOURCE="$SCRIPT_DIR"
+  UNIT_SOURCE="$SCRIPT_DIR/systemd"
+else
+  ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  SOURCE="$ROOT/dist/linux-x86_64"
+  UNIT_SOURCE="$ROOT/systemd"
+fi
 DEST="$HOME/.local/lib/ags-android-capture"
 UNIT_DIR="$HOME/.config/systemd/user"
 
@@ -14,8 +21,8 @@ UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$DEST" "$UNIT_DIR" "$HOME/.config/ags-android-capture" "$HOME/.android"
 systemctl --user stop ags-android-capture.socket ags-android-capture.service >/dev/null 2>&1 || true
 cp -a "$SOURCE/." "$DEST/"
-install -m 644 "$ROOT/systemd/ags-android-capture.socket" "$UNIT_DIR/ags-android-capture.socket"
-install -m 644 "$ROOT/systemd/ags-android-capture.service" "$UNIT_DIR/ags-android-capture.service"
+install -m 644 "$UNIT_SOURCE/ags-android-capture.socket" "$UNIT_DIR/ags-android-capture.socket"
+install -m 644 "$UNIT_SOURCE/ags-android-capture.service" "$UNIT_DIR/ags-android-capture.service"
 if [[ ! -f "$HOME/.config/ags-android-capture/environment" ]]; then
   cat > "$HOME/.config/ags-android-capture/environment" <<'EOF'
 # Comma-separated exact origins of AGS web frontends allowed to request a local stream.

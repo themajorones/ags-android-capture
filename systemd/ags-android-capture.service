@@ -6,7 +6,6 @@ After=ags-android-capture.socket
 [Service]
 Type=simple
 ExecStart=%h/.local/lib/ags-android-capture/ags-android-capture serve --systemd --idle-timeout=60s
-Environment=AGS_CAPTURE_ADB=%h/.local/lib/ags-android-capture/adb
 Environment=AGS_CAPTURE_SCRCPY=%h/.local/lib/ags-android-capture/scrcpy
 Environment=LD_LIBRARY_PATH=%h/.local/lib/ags-android-capture/lib
 EnvironmentFile=-%h/.config/ags-android-capture/environment

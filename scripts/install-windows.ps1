@@ -1,14 +1,19 @@
 $ErrorActionPreference = 'Stop'
 
-$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$Source = Join-Path $Root 'dist\windows-x86_64'
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (Test-Path (Join-Path $ScriptDir 'ags-android-capture.exe')) {
+    $Source = $ScriptDir
+} else {
+    $Root = Split-Path -Parent $ScriptDir
+    $Source = Join-Path $Root 'dist\windows-x86_64'
+}
 $Destination = Join-Path $env:LOCALAPPDATA 'AGS\AndroidCapture'
 if (-not (Test-Path (Join-Path $Source 'ags-android-capture.exe'))) {
     throw 'Build the Windows bundle first using scripts/build-windows.sh in MSYS2 MINGW64.'
 }
 
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-Copy-Item -Path (Join-Path $Source '*') -Destination $Destination -Recurse -Force
+Get-ChildItem -Path $Source -File | Where-Object { $_.Name -notin @('install.ps1', 'README.md') } | Copy-Item -Destination $Destination -Force
 
 $StartScript = Join-Path $Destination 'start-ags-capture.ps1'
 @'

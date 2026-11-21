@@ -90,4 +90,8 @@ done
 
 "$OUT/adb" version >/dev/null
 LD_LIBRARY_PATH="$OUT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$OUT/scrcpy" --version >/dev/null
+install -m 755 "$ROOT/scripts/install-linux.sh" "$OUT/install.sh"
+install -m 644 "$ROOT/README.md" "$OUT/README.md"
+mkdir -p "$OUT/systemd"
+install -m 644 "$ROOT/systemd/ags-android-capture.socket" "$ROOT/systemd/ags-android-capture.service" "$OUT/systemd/"
 echo "Linux bundle built at $OUT"
