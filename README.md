@@ -13,7 +13,7 @@ git submodule update --init --recursive
 
 Linux builds need Go, Meson, Ninja, pkg-config, a C compiler, FFmpeg development libraries, and SDL3 development files. Windows builds run from an MSYS2 MINGW64 shell and are also built by `.github/workflows/build.yml`.
 
-The build downloads pinned official releases of scrcpy's matching Android server and Google Android Platform Tools, verifies SHA-256, and packages ADB plus the server with the bridge. Source pins and the local scrcpy patch are kept in this repository.
+The build downloads pinned releases of scrcpy's matching Android server and verifies SHA-256. Linux x86-64 includes Google Platform Tools ADB; Linux ARM64 includes the runner's ADB, while the bridge prefers a system ADB when installed and falls back to its bundled ADB. Source pins and the local scrcpy patch are kept in this repository. The workflow publishes separate Linux x86-64, Linux ARM64, and Windows x86-64 artifacts.
 
 ## Linux user service
 
