@@ -20,6 +20,7 @@ UNIT_DIR="$HOME/.config/systemd/user"
 
 mkdir -p "$DEST" "$UNIT_DIR" "$HOME/.config/ags-android-capture" "$HOME/.android"
 systemctl --user stop ags-android-capture.socket ags-android-capture.service >/dev/null 2>&1 || true
+if [[ -d "$DEST/lib" ]]; then find "$DEST/lib" -mindepth 1 -maxdepth 1 -type f -delete; fi
 cp -a "$SOURCE/." "$DEST/"
 install -m 644 "$UNIT_SOURCE/ags-android-capture.socket" "$UNIT_DIR/ags-android-capture.socket"
 install -m 644 "$UNIT_SOURCE/ags-android-capture.service" "$UNIT_DIR/ags-android-capture.service"
