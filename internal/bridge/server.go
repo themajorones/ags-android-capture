@@ -20,10 +20,17 @@ type Config struct {
 }
 
 type Server struct {
-	config Config
-	mu     sync.Mutex
-	active bool
-	last   time.Time
+	config  Config
+	mu      sync.Mutex
+	startMu sync.Mutex
+	active  *streamSession
+	last    time.Time
+}
+
+type streamSession struct {
+	serial string
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func New(config Config) *Server {
@@ -69,24 +76,48 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "stream closed")
 
-	s.mu.Lock()
-	if s.active {
-		s.mu.Unlock()
-		_ = conn.Close(websocket.StatusTryAgainLater, "another local stream is active")
-		return
-	}
-	s.active = true
-	s.last = time.Now()
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		s.active = false
-		s.last = time.Now()
-		s.mu.Unlock()
-	}()
-
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	session := &streamSession{serial: request.serial, cancel: cancel, done: make(chan struct{})}
+
+	// A browser can reconnect before its previous WebSocket has cleaned up.
+	// Serialize ownership changes, cancel the current stream, and wait for its
+	// scrcpy process and private ADB server to be reaped before starting another.
+	s.startMu.Lock()
+	s.mu.Lock()
+	previous := s.active
+	if previous != nil {
+		previous.cancel()
+	}
+	s.mu.Unlock()
+	if previous != nil {
+		log.Printf("replacing local stream for %s with request for %s", previous.serial, request.serial)
+		select {
+		case <-previous.done:
+		case <-ctx.Done():
+			s.startMu.Unlock()
+			return
+		}
+	}
+	if ctx.Err() != nil {
+		s.startMu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	s.active = session
+	s.last = time.Now()
+	s.mu.Unlock()
+	s.startMu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.active == session {
+			s.active = nil
+			s.last = time.Now()
+		}
+		s.mu.Unlock()
+		close(session.done)
+	}()
+
 	if err := s.runStream(ctx, conn, request); err != nil && ctx.Err() == nil {
 		log.Printf("device stream ended: %v", err)
 		_ = conn.Close(websocket.StatusInternalError, "device stream ended")
@@ -96,7 +127,7 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 func (s *Server) isActive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.active
+	return s.active != nil
 }
 
 func (s *Server) originAllowed(origin string) bool {
@@ -123,7 +154,7 @@ func (s *Server) ExitWhenIdle(ctx context.Context, server *http.Server) {
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			idle := !s.active && time.Since(s.last) >= s.config.IdleTimeout
+			idle := s.active == nil && time.Since(s.last) >= s.config.IdleTimeout
 			s.mu.Unlock()
 			if idle {
 				log.Print("no local stream requested; stopping the per-user bridge")
