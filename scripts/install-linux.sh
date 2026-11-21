@@ -7,7 +7,12 @@ if [[ -x "$SCRIPT_DIR/ags-android-capture" ]]; then
   UNIT_SOURCE="$SCRIPT_DIR/systemd"
 else
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-  SOURCE="$ROOT/dist/linux-x86_64"
+  case "$(uname -m)" in
+    x86_64) PACKAGE_ARCH=x86_64 ;;
+    aarch64|arm64) PACKAGE_ARCH=arm64 ;;
+    *) echo "Unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+  esac
+  SOURCE="$ROOT/dist/linux-$PACKAGE_ARCH"
   UNIT_SOURCE="$ROOT/systemd"
 fi
 DEST="$HOME/.local/lib/ags-android-capture"
