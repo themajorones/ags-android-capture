@@ -1,5 +1,13 @@
 $ErrorActionPreference = 'Stop'
 
+trap {
+    Write-Host ''
+    Write-Host 'AGS Android Capture installation failed:' -ForegroundColor Red
+    Write-Host ($_ | Format-List * -Force | Out-String) -ForegroundColor Red
+    Read-Host 'Press Enter to close this window'
+    exit 1
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (Test-Path (Join-Path $ScriptDir 'ags-android-capture.exe')) {
     $Source = $ScriptDir
