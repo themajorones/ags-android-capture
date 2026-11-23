@@ -42,4 +42,4 @@ The Windows output bundle includes `install.ps1`; run it from PowerShell after e
 
 ## Browser behavior
 
-The AGS page requests `ws://127.0.0.1:17653/v1/stream` with the selected ADB serial, bitrate, and FPS. The bridge accepts any browser `Origin`, permits concurrent streams, and rejects non-loopback listeners. Each stream gets an isolated ADB server using the system ADB executable, leaving the machine's normal ADB server untouched.
+The AGS page requests `ws://127.0.0.1:17653/v1/stream` with the selected ADB serial, bitrate, and FPS. The bridge accepts any browser `Origin`, permits concurrent streams, and rejects non-loopback listeners. It uses the system ADB executable and the user's default shared ADB server, so devices connected for AGS also appear in terminal `adb devices`. Closing a stream stops its scrcpy process but leaves the shared ADB server and device connection available to other tools.

@@ -140,6 +140,23 @@ func TestForwardInputFramesControlPackets(t *testing.T) {
 	}
 }
 
+func TestADBEnvironmentUsesSharedDefaultServer(t *testing.T) {
+	environment := adbEnvironment("/usr/bin/adb", []string{
+		"PATH=/usr/bin",
+		"ADB=/old/adb",
+		"ADB_SERVER_SOCKET=tcp:127.0.0.1:5038",
+		"ANDROID_ADB_SERVER_PORT=5038",
+		"KEEP=value",
+	})
+	got := strings.Join(environment, "\n")
+	if !strings.Contains(got, "ADB=/usr/bin/adb") || !strings.Contains(got, "PATH=/usr/bin") || !strings.Contains(got, "KEEP=value") {
+		t.Fatalf("ADB environment lost required values: %q", got)
+	}
+	if strings.Contains(got, "ADB_SERVER_SOCKET=") || strings.Contains(got, "ANDROID_ADB_SERVER_PORT=") || strings.Contains(got, "ADB=/old/adb") {
+		t.Fatalf("ADB environment still overrides the shared server: %q", got)
+	}
+}
+
 func TestMultipleBrowserStreamsRemainIndependent(t *testing.T) {
 	t.Setenv("AGS_BRIDGE_TEST_CHILD", "1")
 	executable, err := os.Executable()

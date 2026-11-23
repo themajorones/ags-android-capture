@@ -24,11 +24,10 @@ import (
 const maxControlPacket = 256 * 1024
 
 func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request streamRequest) error {
-	adbEnv, streamSerial, cleanupADB, err := s.connectDevice(parent, request.serial)
+	adbEnv, streamSerial, err := s.connectDevice(parent, request.serial)
 	if err != nil {
 		return err
 	}
-	defer cleanupADB()
 	unlockStartup, err := s.acquireDeviceStartup(parent, streamSerial)
 	if err != nil {
 		return fmt.Errorf("wait to start scrcpy for %s: %w", streamSerial, err)
@@ -186,38 +185,24 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 	return nil
 }
 
-func (s *Server) connectDevice(ctx context.Context, serial string) ([]string, string, func(), error) {
-	port, err := reserveLoopbackPort()
-	if err != nil {
-		return nil, "", func() {}, err
-	}
-	adbPort := strconv.Itoa(port)
-	env := append(os.Environ(),
-		"ADB="+s.config.ADBPath,
-		"ANDROID_ADB_SERVER_PORT="+adbPort,
-	)
+func (s *Server) connectDevice(ctx context.Context, serial string) ([]string, string, error) {
+	env := adbEnvironment(s.config.ADBPath, os.Environ())
 	connectedSerial := serial
-	cleanup := func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if hasHostPort(connectedSerial) {
-			_, _ = runADB(cleanupCtx, s.config.ADBPath, env, "disconnect", connectedSerial)
-		}
-		_, _ = runADB(cleanupCtx, s.config.ADBPath, env, "kill-server")
-	}
+	// AGS shares the user's normal ADB server so its connections are visible
+	// to terminal ADB clients. Do not disconnect devices or stop that server
+	// when a browser stream closes; both may be in use outside this helper.
 
 	startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if output, err := runADB(startCtx, s.config.ADBPath, env, "start-server"); err != nil {
-		cleanup()
-		return nil, "", func() {}, fmt.Errorf("start system ADB: %s: %w", strings.TrimSpace(output), err)
+		return nil, "", fmt.Errorf("start system ADB: %s: %w", strings.TrimSpace(output), err)
 	}
 	candidates := []string{serial}
 	if hasHostPort(serial) {
+		var err error
 		candidates, err = resolveSerialCandidates(ctx, serial)
 		if err != nil {
-			cleanup()
-			return nil, "", func() {}, fmt.Errorf("resolve Android device %s: %w", serial, err)
+			return nil, "", fmt.Errorf("resolve Android device %s: %w", serial, err)
 		}
 		var failures []string
 		connected := false
@@ -248,8 +233,7 @@ func (s *Server) connectDevice(ctx context.Context, serial string) ([]string, st
 			failures = append(failures, fmt.Sprintf("%s: %s", candidate, strings.TrimSpace(state)))
 		}
 		if !connected {
-			cleanup()
-			return nil, "", func() {}, fmt.Errorf("connect to Android device %s: %s", serial, strings.Join(failures, "; "))
+			return nil, "", fmt.Errorf("connect to Android device %s: %s", serial, strings.Join(failures, "; "))
 		}
 	}
 
@@ -259,17 +243,27 @@ func (s *Server) connectDevice(ctx context.Context, serial string) ([]string, st
 		output, stateErr := runADB(stateCtx, s.config.ADBPath, env, "-s", connectedSerial, "get-state")
 		stateCancel()
 		if stateErr == nil && strings.TrimSpace(output) == "device" {
-			return env, connectedSerial, cleanup, nil
+			return env, connectedSerial, nil
 		}
 		select {
 		case <-ctx.Done():
-			cleanup()
-			return nil, "", func() {}, ctx.Err()
+			return nil, "", ctx.Err()
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
-	cleanup()
-	return nil, "", func() {}, fmt.Errorf("Android device %s did not become ready", connectedSerial)
+	return nil, "", fmt.Errorf("Android device %s did not become ready", connectedSerial)
+}
+
+func adbEnvironment(adbPath string, environment []string) []string {
+	filtered := make([]string, 0, len(environment)+1)
+	for _, entry := range environment {
+		key, _, hasValue := strings.Cut(entry, "=")
+		if hasValue && (key == "ADB" || key == "ADB_SERVER_SOCKET" || key == "ANDROID_ADB_SERVER_PORT") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return append(filtered, "ADB="+adbPath)
 }
 
 // Android endpoint hostnames may resolve to IPv6 link-local addresses before
@@ -323,15 +317,6 @@ func runADB(ctx context.Context, executable string, env []string, args ...string
 	command.Stderr = &output
 	err := command.Run()
 	return output.String(), err
-}
-
-func reserveLoopbackPort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
 func hasHostPort(serial string) bool {
