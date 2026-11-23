@@ -44,6 +44,41 @@ try {
 }
 
 New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+$InstalledExecutable = [System.IO.Path]::GetFullPath((Join-Path $Destination 'ags-android-capture.exe'))
+
+# The per-user scheduled task keeps the bridge process alive, which locks its
+# executable on Windows. Stop both the task and only the bridge process from
+# this install before replacing the bundle. Kill the process tree so an active
+# scrcpy child cannot be left behind; the shared system ADB server is separate
+# and is intentionally left running.
+$CaptureTask = Get-ScheduledTask -TaskName 'AGS Android Capture' -ErrorAction SilentlyContinue
+if ($CaptureTask -and $CaptureTask.State -eq 'Running') {
+    Stop-ScheduledTask -TaskName 'AGS Android Capture'
+    $TaskStopDeadline = (Get-Date).AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 200
+        $CaptureTask = Get-ScheduledTask -TaskName 'AGS Android Capture' -ErrorAction SilentlyContinue
+    } while ($CaptureTask -and $CaptureTask.State -eq 'Running' -and (Get-Date) -lt $TaskStopDeadline)
+}
+
+$InstalledProcesses = Get-CimInstance Win32_Process -Filter "name = 'ags-android-capture.exe'" |
+    Where-Object {
+        $_.ExecutablePath -and
+        [string]::Equals([System.IO.Path]::GetFullPath($_.ExecutablePath), $InstalledExecutable,
+            [System.StringComparison]::OrdinalIgnoreCase)
+    }
+foreach ($CaptureProcess in $InstalledProcesses) {
+    & taskkill.exe /PID $CaptureProcess.ProcessId /T /F | Out-Null
+    $ProcessStopDeadline = (Get-Date).AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 200
+        $StillRunning = Get-CimInstance Win32_Process -Filter "ProcessId = $($CaptureProcess.ProcessId)" -ErrorAction SilentlyContinue
+    } while ($StillRunning -and (Get-Date) -lt $ProcessStopDeadline)
+    if ($StillRunning) {
+        throw "Could not stop the installed capture bridge (PID $($CaptureProcess.ProcessId)); close it before retrying installation."
+    }
+}
+
 Get-ChildItem -Path $Source -File | Where-Object { $_.Name -notin @('install.ps1', 'README.md') } | Copy-Item -Destination $Destination -Force
 Remove-Item -Path (Join-Path $Destination 'adb.exe'), (Join-Path $Destination 'AdbWinApi.dll'), (Join-Path $Destination 'AdbWinUsbApi.dll') -Force -ErrorAction SilentlyContinue
 
