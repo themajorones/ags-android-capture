@@ -23,12 +23,18 @@ type Server struct {
 	config       Config
 	mu           sync.Mutex
 	streams      map[*streamSession]struct{}
+	deviceStream map[string]*streamSession
 	deviceStarts map[string]*deviceStartGate
 	last         time.Time
 }
 
+// A device has one scrcpy owner at a time. This prevents duplicate browser
+// tabs or reconnects from launching competing Android mirror servers, while
+// streams for different devices remain independent.
 type streamSession struct {
 	serial string
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type deviceStartGate struct {
@@ -46,6 +52,7 @@ func New(config Config) *Server {
 	return &Server{
 		config:       config,
 		streams:      make(map[*streamSession]struct{}),
+		deviceStream: make(map[string]*streamSession),
 		deviceStarts: make(map[string]*deviceStartGate),
 		last:         time.Now(),
 	}
@@ -128,9 +135,11 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	session := &streamSession{serial: request.serial}
+	session := &streamSession{serial: request.serial, cancel: cancel, done: make(chan struct{})}
 	s.mu.Lock()
+	previous := s.deviceStream[request.serial]
 	s.streams[session] = struct{}{}
+	s.deviceStream[request.serial] = session
 	s.last = time.Now()
 	activeStreams := len(s.streams)
 	s.mu.Unlock()
@@ -139,11 +148,27 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		s.mu.Lock()
 		delete(s.streams, session)
+		if s.deviceStream[request.serial] == session {
+			delete(s.deviceStream, request.serial)
+		}
 		s.last = time.Now()
 		activeStreams := len(s.streams)
 		s.mu.Unlock()
+		close(session.done)
 		log.Printf("browser stream closed for %s (active streams: %d)", request.serial, activeStreams)
 	}()
+	if previous != nil {
+		log.Printf("replacing existing stream for %s", request.serial)
+		previous.cancel()
+		select {
+		case <-previous.done:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
 
 	if err := s.runStream(ctx, conn, request); err != nil && ctx.Err() == nil {
 		log.Printf("device stream ended: %v", err)
