@@ -1,6 +1,6 @@
 # AGS Android Capture
 
-A local browser bridge for Android Game View. It runs the packaged ADB and a patched scrcpy client on the browser's computer, then sends the encoded H.264 packets directly to the page over loopback WebSocket. It does not open a desktop video window or relay video through the AGS server.
+A local browser bridge for Android Game View. It runs system ADB and the AGS-patched scrcpy client on the browser's computer, then sends encoded H.264 packets directly to the page over loopback WebSocket. It does not open a desktop video window or relay video through the AGS server.
 
 ## Build
 
@@ -13,7 +13,7 @@ git submodule update --init --recursive
 
 Linux builds need Go, Meson, Ninja, pkg-config, a C compiler, FFmpeg development libraries, and SDL3 development files. Linux installs require the system FFmpeg runtime and SDL3 runtime. The installer checks that FFmpeg starts and that all dynamic libraries required by scrcpy resolve before it stops or replaces an existing installation. Linux artifacts use the host's FFmpeg and SDL runtime libraries; build on the target distribution so the library ABI matches. Windows builds run from an MSYS2 MINGW64 shell and are also built by `.github/workflows/build.yml`.
 
-The build downloads pinned releases of scrcpy's matching Android server and verifies SHA-256. Linux x86-64 includes Google Platform Tools ADB; Linux ARM64 includes the runner's ADB, while the bridge prefers a system ADB when installed and falls back to its bundled ADB. Source pins and the local scrcpy patch are kept in this repository. The workflow publishes separate Linux x86-64, Linux ARM64, and Windows x86-64 artifacts.
+The build downloads the pinned scrcpy Android server and verifies its SHA-256. ADB is not bundled: install Android Platform Tools on the computer running the browser. The installer checks that system `adb` is available and records its executable path for the bridge. The helper uses the AGS-patched scrcpy client and its matching Android server; ordinary system scrcpy builds do not implement the browser stream protocol. The workflow publishes separate Linux x86-64, Linux ARM64, and Windows x86-64 artifacts.
 
 ## Linux user service
 
@@ -23,9 +23,9 @@ After building, the output bundle includes an installer. For a downloaded GitHub
 ./install.sh
 ```
 
-When installing from a source checkout, run `./scripts/install-linux.sh` instead. The installer uses system `adb` when it is on `PATH`; otherwise it uses the bundled copy.
+When installing from a source checkout, run `./scripts/install-linux.sh` instead. The installer requires system `adb` on `PATH` and verifies it before changing the existing installation.
 
-The user socket listens only on `127.0.0.1:17653`. systemd starts the bridge when the browser connects; the bridge exits after one minute without a stream. The per-user socket stays ready for the next request. Set the exact AGS page origins allowed to connect in `~/.config/ags-android-capture/environment`, then restart the socket if you change the listener configuration.
+The user socket listens only on `127.0.0.1:17653`. systemd starts the bridge when the browser connects; the bridge exits after one minute without a stream. The per-user socket stays ready for the next request. The bridge accepts requests from any browser origin so the same helper works with AGS on different machines and hostnames.
 
 Check it with:
 
@@ -42,4 +42,4 @@ The Windows output bundle includes `install.ps1`; run it from PowerShell after e
 
 ## Browser behavior
 
-The AGS page requests `ws://127.0.0.1:17653/v1/stream` with the selected ADB serial, bitrate, and FPS. The bridge checks the exact browser `Origin`, allows one active stream, and rejects non-loopback listeners. ADB uses a separate private local ADB server for the stream, leaving the machine's normal ADB server untouched.
+The AGS page requests `ws://127.0.0.1:17653/v1/stream` with the selected ADB serial, bitrate, and FPS. The bridge accepts any browser `Origin`, permits concurrent streams, and rejects non-loopback listeners. Each stream gets an isolated ADB server using the system ADB executable, leaving the machine's normal ADB server untouched.

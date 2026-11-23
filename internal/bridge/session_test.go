@@ -6,11 +6,34 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"nhooyr.io/websocket"
 )
+
+// The Go test executable doubles as ADB and scrcpy subprocesses in the
+// concurrent-stream integration test below.
+func init() {
+	if os.Getenv("AGS_BRIDGE_TEST_CHILD") != "1" {
+		return
+	}
+	args := strings.Join(os.Args[1:], " ")
+	if strings.Contains(args, "--ags-browser-stream") {
+		_, _ = os.Stdout.Write([]byte{'A', 'G', 'S', 'C', 0, 0, 3, 32, 0, 0, 2, 88})
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			_, _ = os.Stdout.Write([]byte{0, 0, 0, 1, 0x65, 0x88, 0x84})
+		}
+	}
+	if strings.Contains(args, "get-state") {
+		_, _ = io.WriteString(os.Stdout, "device\n")
+	}
+	os.Exit(0)
+}
 
 type shortWriter struct{ data []byte }
 
@@ -115,6 +138,85 @@ func TestForwardInputFramesControlPackets(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("forwardInput did not finish after browser disconnect")
 	}
+}
+
+func TestMultipleBrowserStreamsRemainIndependent(t *testing.T) {
+	t.Setenv("AGS_BRIDGE_TEST_CHILD", "1")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(Config{
+		ADBPath:         executable,
+		ScrcpyPath:      executable,
+		AllowedOrigins:  []string{"*"},
+		IdleTimeout:     -1,
+		SessionWaitTime: 5 * time.Second,
+	})
+	httpServer := httptest.NewServer(http.HandlerFunc(server.Stream))
+	defer httpServer.Close()
+	streamURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/v1/stream?serial="
+	dial := func(serial string) *websocket.Conn {
+		t.Helper()
+		connection, _, dialErr := websocket.Dial(context.Background(), streamURL+serial, &websocket.DialOptions{
+			HTTPHeader: http.Header{"Origin": []string{"http://ags.example"}},
+		})
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		return connection
+	}
+	read := func(connection *websocket.Conn) (websocket.MessageType, []byte) {
+		t.Helper()
+		readContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		kind, data, readErr := connection.Read(readContext)
+		if readErr != nil {
+			t.Fatalf("read concurrent stream: %v", readErr)
+		}
+		return kind, data
+	}
+	first := dial("device-1")
+	defer first.Close(websocket.StatusNormalClosure, "test complete")
+	if kind, data := read(first); kind != websocket.MessageText || !strings.Contains(string(data), `"kind":"metadata"`) {
+		t.Fatalf("first stream metadata = (%v, %s)", kind, data)
+	}
+	if kind, _ := read(first); kind != websocket.MessageBinary {
+		t.Fatalf("first stream frame type = %v, want binary", kind)
+	}
+
+	second := dial("device-1")
+	if kind, data := read(second); kind != websocket.MessageText || !strings.Contains(string(data), `"kind":"metadata"`) {
+		t.Fatalf("second stream metadata = (%v, %s)", kind, data)
+	}
+	if kind, _ := read(second); kind != websocket.MessageBinary {
+		t.Fatalf("second stream frame type = %v, want binary", kind)
+	}
+	waitForStreamCount(t, server, 2)
+
+	// Starting the second stream must not cancel or replace the first stream.
+	if kind, _ := read(first); kind != websocket.MessageBinary {
+		t.Fatalf("first stream stopped after second connected: message type %v", kind)
+	}
+	_ = first.Close(websocket.StatusNormalClosure, "close first")
+	waitForStreamCount(t, server, 1)
+	if kind, _ := read(second); kind != websocket.MessageBinary {
+		t.Fatalf("second stream stopped after first closed: message type %v", kind)
+	}
+	_ = second.Close(websocket.StatusNormalClosure, "close second")
+	waitForStreamCount(t, server, 0)
+}
+
+func waitForStreamCount(t *testing.T, server *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := server.activeStreamCount(); got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("active stream count = %d, want %d", server.activeStreamCount(), want)
 }
 
 type chunkReader struct {

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,14 +24,27 @@ import (
 const maxControlPacket = 256 * 1024
 
 func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request streamRequest) error {
-	adbEnv, cleanupADB, err := s.connectDevice(parent, request.serial)
+	adbEnv, streamSerial, cleanupADB, err := s.connectDevice(parent, request.serial)
 	if err != nil {
 		return err
 	}
 	defer cleanupADB()
+	unlockStartup, err := s.acquireDeviceStartup(parent, streamSerial)
+	if err != nil {
+		return fmt.Errorf("wait to start scrcpy for %s: %w", streamSerial, err)
+	}
+	startupLocked := true
+	defer func() {
+		if startupLocked {
+			unlockStartup()
+		}
+	}()
+	if err := parent.Err(); err != nil {
+		return err
+	}
 
 	args := []string{
-		"--serial", request.serial,
+		"--serial", streamSerial,
 		"--video-bit-rate", strconv.Itoa(request.bitrate),
 		"--max-fps", strconv.Itoa(request.fps),
 		"--no-audio", "--no-window", "--no-video-playback",
@@ -120,6 +134,8 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 		_ = command.Wait()
 		return parent.Err()
 	}
+	unlockStartup()
+	startupLocked = false
 
 	metadata, _ := json.Marshal(map[string]any{
 		"kind": "metadata", "width": streamWidth, "height": streamHeight,
@@ -170,21 +186,22 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 	return nil
 }
 
-func (s *Server) connectDevice(ctx context.Context, serial string) ([]string, func(), error) {
+func (s *Server) connectDevice(ctx context.Context, serial string) ([]string, string, func(), error) {
 	port, err := reserveLoopbackPort()
 	if err != nil {
-		return nil, func() {}, err
+		return nil, "", func() {}, err
 	}
 	adbPort := strconv.Itoa(port)
 	env := append(os.Environ(),
 		"ADB="+s.config.ADBPath,
 		"ANDROID_ADB_SERVER_PORT="+adbPort,
 	)
+	connectedSerial := serial
 	cleanup := func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if hasHostPort(serial) {
-			_, _ = runADB(cleanupCtx, s.config.ADBPath, env, "disconnect", serial)
+		if hasHostPort(connectedSerial) {
+			_, _ = runADB(cleanupCtx, s.config.ADBPath, env, "disconnect", connectedSerial)
 		}
 		_, _ = runADB(cleanupCtx, s.config.ADBPath, env, "kill-server")
 	}
@@ -193,35 +210,109 @@ func (s *Server) connectDevice(ctx context.Context, serial string) ([]string, fu
 	defer cancel()
 	if output, err := runADB(startCtx, s.config.ADBPath, env, "start-server"); err != nil {
 		cleanup()
-		return nil, func() {}, fmt.Errorf("start packaged ADB: %s: %w", strings.TrimSpace(output), err)
+		return nil, "", func() {}, fmt.Errorf("start system ADB: %s: %w", strings.TrimSpace(output), err)
 	}
+	candidates := []string{serial}
 	if hasHostPort(serial) {
-		connectCtx, connectCancel := context.WithTimeout(ctx, 10*time.Second)
-		output, err := runADB(connectCtx, s.config.ADBPath, env, "connect", serial)
-		connectCancel()
-		if err != nil || strings.Contains(strings.ToLower(output), "failed to connect") {
+		candidates, err = resolveSerialCandidates(ctx, serial)
+		if err != nil {
 			cleanup()
-			return nil, func() {}, fmt.Errorf("connect to Android device %s: %s", serial, strings.TrimSpace(output))
+			return nil, "", func() {}, fmt.Errorf("resolve Android device %s: %w", serial, err)
+		}
+		var failures []string
+		connected := false
+		connectDeadline := time.Now().Add(10 * time.Second)
+		for _, candidate := range candidates {
+			remaining := time.Until(connectDeadline)
+			if remaining <= 0 {
+				break
+			}
+			attemptTimeout := min(5*time.Second, remaining)
+			connectCtx, connectCancel := context.WithTimeout(ctx, attemptTimeout)
+			output, connectErr := runADB(connectCtx, s.config.ADBPath, env, "connect", candidate)
+			connectCancel()
+			lowerOutput := strings.ToLower(output)
+			if connectErr != nil || strings.Contains(lowerOutput, "failed to connect") || strings.Contains(lowerOutput, "cannot connect") {
+				failures = append(failures, fmt.Sprintf("%s: %s", candidate, strings.TrimSpace(output)))
+				continue
+			}
+
+			stateCtx, stateCancel := context.WithTimeout(ctx, 2*time.Second)
+			state, stateErr := runADB(stateCtx, s.config.ADBPath, env, "-s", candidate, "get-state")
+			stateCancel()
+			if stateErr == nil && strings.TrimSpace(state) == "device" {
+				connectedSerial = candidate
+				connected = true
+				break
+			}
+			failures = append(failures, fmt.Sprintf("%s: %s", candidate, strings.TrimSpace(state)))
+		}
+		if !connected {
+			cleanup()
+			return nil, "", func() {}, fmt.Errorf("connect to Android device %s: %s", serial, strings.Join(failures, "; "))
 		}
 	}
 
 	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) {
 		stateCtx, stateCancel := context.WithTimeout(ctx, 2*time.Second)
-		output, stateErr := runADB(stateCtx, s.config.ADBPath, env, "-s", serial, "get-state")
+		output, stateErr := runADB(stateCtx, s.config.ADBPath, env, "-s", connectedSerial, "get-state")
 		stateCancel()
 		if stateErr == nil && strings.TrimSpace(output) == "device" {
-			return env, cleanup, nil
+			return env, connectedSerial, cleanup, nil
 		}
 		select {
 		case <-ctx.Done():
 			cleanup()
-			return nil, func() {}, ctx.Err()
+			return nil, "", func() {}, ctx.Err()
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
 	cleanup()
-	return nil, func() {}, fmt.Errorf("Android device %s did not become ready", serial)
+	return nil, "", func() {}, fmt.Errorf("Android device %s did not become ready", connectedSerial)
+}
+
+// Android endpoint hostnames may resolve to IPv6 link-local addresses before
+// usable IPv4 addresses on Windows. ADB's hostname resolver can select that
+// unreachable address and fail without trying the other records. Resolve the
+// endpoint here, prefer IPv4, and pass the concrete serial to both ADB and
+// scrcpy so the chosen route stays consistent for the entire stream.
+func resolveSerialCandidates(ctx context.Context, serial string) ([]string, error) {
+	host, port, err := net.SplitHostPort(serial)
+	if err != nil {
+		return nil, err
+	}
+	addresses := []net.IP{}
+	if ip := net.ParseIP(host); ip != nil {
+		addresses = append(addresses, ip)
+	} else {
+		addresses, err = net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("hostname returned no addresses")
+	}
+	sort.SliceStable(addresses, func(i, j int) bool {
+		return addresses[i].To4() != nil && addresses[j].To4() == nil
+	})
+	candidates := make([]string, 0, len(addresses)+1)
+	seen := make(map[string]struct{}, len(addresses)+1)
+	for _, address := range addresses {
+		candidate := net.JoinHostPort(address.String(), port)
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	if net.ParseIP(host) == nil {
+		if _, exists := seen[serial]; !exists {
+			candidates = append(candidates, serial)
+		}
+	}
+	return candidates, nil
 }
 
 func runADB(ctx context.Context, executable string, env []string, args ...string) (string, error) {

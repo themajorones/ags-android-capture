@@ -7,20 +7,21 @@ import (
 
 func TestParseStreamRequest(t *testing.T) {
 	tests := []struct {
-		name       string
-		query      string
-		wantSerial string
-		wantFPS    int
-		wantRate   int
-		wantErr    bool
+		name        string
+		query       string
+		wantSerial  string
+		wantFPS     int
+		wantRate    int
+		wantMaxSize int
+		wantErr     bool
 	}{
-		{"defaults", "serial=device-1", "device-1", 30, 4_000_000, false},
-		{"requested stream settings", "serial=192.168.1.4%3A5555&fps=24&bitrate=1500000&maxSize=1080", "192.168.1.4:5555", 24, 1_500_000, false},
-		{"invalid device id", "serial=bad%3Bcommand", "", 0, 0, true},
-		{"invalid port", "serial=host%3A70000", "", 0, 0, true},
-		{"fps too high", "serial=host%3A5555&fps=61", "", 0, 0, true},
-		{"bitrate too low", "serial=host%3A5555&bitrate=99", "", 0, 0, true},
-		{"max size too high", "serial=host%3A5555&maxSize=10000", "", 0, 0, true},
+		{"defaults", "serial=device-1", "device-1", 30, 4_000_000, 0, false},
+		{"requested stream settings", "serial=192.168.1.4%3A5555&fps=24&bitrate=1500000&maxSize=1080", "192.168.1.4:5555", 24, 1_500_000, 1080, false},
+		{"invalid device id", "serial=bad%3Bcommand", "", 0, 0, 0, true},
+		{"invalid port", "serial=host%3A70000", "", 0, 0, 0, true},
+		{"fps too high", "serial=host%3A5555&fps=61", "", 0, 0, 0, true},
+		{"bitrate too low", "serial=host%3A5555&bitrate=99", "", 0, 0, 0, true},
+		{"max size too high", "serial=host%3A5555&maxSize=10000", "", 0, 0, 0, true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -28,7 +29,7 @@ func TestParseStreamRequest(t *testing.T) {
 			if (err != nil) != test.wantErr {
 				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
 			}
-			if err == nil && (request.serial != test.wantSerial || request.fps != test.wantFPS || request.bitrate != test.wantRate) {
+			if err == nil && (request.serial != test.wantSerial || request.fps != test.wantFPS || request.bitrate != test.wantRate || request.maxSize != test.wantMaxSize) {
 				t.Fatalf("request = %#v", request)
 			}
 		})

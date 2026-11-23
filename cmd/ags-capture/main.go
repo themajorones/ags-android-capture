@@ -44,15 +44,15 @@ func main() {
 		}
 		_ = os.Setenv("LD_LIBRARY_PATH", libraryPath)
 	}
-	adbPath := envOr("AGS_CAPTURE_ADB", systemOrBundledADB(assetDir))
-	scrcpyPath := envOr("AGS_CAPTURE_SCRCPY", filepath.Join(assetDir, exeName("scrcpy")))
-	allowedOrigins := splitList(os.Getenv("AGS_CAPTURE_ALLOWED_ORIGINS"))
-	if len(allowedOrigins) == 0 {
-		allowedOrigins = []string{
-			"http://localhost:7530", "http://127.0.0.1:7530",
-			"http://bigscreen:7530", "http://devnode:7530",
-		}
+	adbPath, err := systemADBPath()
+	if err != nil {
+		log.Fatal(err)
 	}
+	log.Printf("using system ADB executable: %s", adbPath)
+	scrcpyPath := envOr("AGS_CAPTURE_SCRCPY", filepath.Join(assetDir, exeName("scrcpy")))
+	// AGS can be served from any user-managed machine, hostname, address, or
+	// browser port. The helper itself remains bound to loopback.
+	allowedOrigins := []string{"*"}
 
 	server := bridge.New(bridge.Config{
 		ADBPath:         adbPath,
@@ -91,11 +91,19 @@ func main() {
 	}
 }
 
-func systemOrBundledADB(assetDir string) string {
-	if path, err := exec.LookPath("adb"); err == nil {
-		return path
+func systemADBPath() (string, error) {
+	if configured := os.Getenv("AGS_CAPTURE_ADB"); configured != "" {
+		path, err := exec.LookPath(configured)
+		if err != nil {
+			return "", fmt.Errorf("AGS_CAPTURE_ADB does not point to an executable: %w", err)
+		}
+		return path, nil
 	}
-	return filepath.Join(assetDir, exeName("adb"))
+	path, err := exec.LookPath("adb")
+	if err != nil {
+		return "", fmt.Errorf("system ADB was not found on PATH; install Android Platform Tools or set AGS_CAPTURE_ADB: %w", err)
+	}
+	return path, nil
 }
 
 func getListener(address string, systemd bool) (net.Listener, error) {
@@ -129,14 +137,4 @@ func envOr(name, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func splitList(value string) []string {
-	var result []string
-	for _, entry := range strings.Split(value, ",") {
-		if trimmed := strings.TrimSpace(entry); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }

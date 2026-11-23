@@ -18,10 +18,20 @@ fi
 DEST="$HOME/.local/lib/ags-android-capture"
 UNIT_DIR="$HOME/.config/systemd/user"
 
-[[ -x "$SOURCE/ags-android-capture" && -x "$SOURCE/adb" && -x "$SOURCE/scrcpy" ]] || {
+[[ -x "$SOURCE/ags-android-capture" && -x "$SOURCE/scrcpy" ]] || {
   echo "Build the Linux bundle first with scripts/build-linux.sh" >&2
   exit 1
 }
+
+ADB_PATH="$(command -v adb || true)"
+[[ -n "$ADB_PATH" ]] || {
+  echo "Missing runtime requirement: system ADB. Install Android Platform Tools, then run this installer again." >&2
+  exit 1
+}
+if ! "$ADB_PATH" version >/dev/null 2>&1; then
+  echo "System ADB was found at $ADB_PATH but could not start. Repair Android Platform Tools before installing the capture bridge." >&2
+  exit 1
+fi
 
 # Linux scrcpy is linked against the target machine's FFmpeg and SDL runtime.
 # Check the bundle before stopping/replacing a working installation so an
@@ -38,7 +48,7 @@ if ! command -v ldd >/dev/null 2>&1; then
   echo "Missing installer requirement: ldd (provided by the system C runtime tools). Cannot verify scrcpy runtime libraries." >&2
   exit 1
 fi
-SCRCPY_DEPS="$(ldd "$SOURCE/scrcpy" 2>&1)" || {
+SCRCPY_DEPS="$(LD_LIBRARY_PATH="$SOURCE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$SOURCE/scrcpy" 2>&1)" || {
   echo "Could not inspect the scrcpy runtime dependencies:" >&2
   echo "$SCRCPY_DEPS" >&2
   exit 1
@@ -51,18 +61,24 @@ if grep -q 'not found' <<<"$SCRCPY_DEPS"; then
 fi
 
 mkdir -p "$DEST" "$UNIT_DIR" "$HOME/.config/ags-android-capture" "$HOME/.android"
+chmod 700 "$HOME/.config/ags-android-capture"
+ENV_FILE="$HOME/.config/ags-android-capture/environment"
+ENV_TEMP="$(mktemp "$HOME/.config/ags-android-capture/environment.XXXXXX")"
+if [[ -f "$ENV_FILE" ]]; then
+  awk '!/^AGS_CAPTURE_ADB=/' "$ENV_FILE" > "$ENV_TEMP"
+fi
+ADB_ENV_PATH="${ADB_PATH//\\/\\\\}"
+ADB_ENV_PATH="${ADB_ENV_PATH//\"/\\\"}"
+printf 'AGS_CAPTURE_ADB="%s"\n' "$ADB_ENV_PATH" >> "$ENV_TEMP"
+chmod 600 "$ENV_TEMP"
 systemctl --user stop ags-android-capture.socket ags-android-capture.service >/dev/null 2>&1 || true
 if [[ -d "$DEST/lib" ]]; then find "$DEST/lib" -mindepth 1 -maxdepth 1 -type f -delete; fi
 cp -a "$SOURCE/." "$DEST/"
+rm -f "$DEST/adb" "$DEST/adb.exe" "$DEST/AdbWinApi.dll" "$DEST/AdbWinUsbApi.dll"
+rm -rf "$DEST/lib64"
+mv "$ENV_TEMP" "$ENV_FILE"
 install -m 644 "$UNIT_SOURCE/ags-android-capture.socket" "$UNIT_DIR/ags-android-capture.socket"
 install -m 644 "$UNIT_SOURCE/ags-android-capture.service" "$UNIT_DIR/ags-android-capture.service"
-if [[ ! -f "$HOME/.config/ags-android-capture/environment" ]]; then
-  cat > "$HOME/.config/ags-android-capture/environment" <<'EOF'
-# Comma-separated exact origins of AGS web frontends allowed to request a local stream.
-AGS_CAPTURE_ALLOWED_ORIGINS=http://localhost:7530,http://127.0.0.1:7530,http://bigscreen:7530,http://devnode:7530
-EOF
-fi
-
 systemctl --user daemon-reload
 if ! systemctl --user enable --now ags-android-capture.socket; then
   cat >&2 <<'EOF'
@@ -78,5 +94,4 @@ if ! systemctl --user is-active --quiet ags-android-capture.socket; then
   echo "AGS Android capture socket did not become active." >&2
   exit 1
 fi
-echo "Installed. The bridge process starts on a browser request; systemd keeps only its loopback socket listening."
-echo "Allowed web origins are in $HOME/.config/ags-android-capture/environment"
+echo "Installed. The bridge uses system ADB at $ADB_PATH and starts on a browser request; systemd keeps only its loopback socket listening."

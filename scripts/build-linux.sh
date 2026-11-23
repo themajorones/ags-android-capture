@@ -3,22 +3,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRCPY_VERSION="5.0.1"
-ADB_VERSION="37.0.3"
 SCRCPY_SERVER_SHA256="764eb6f79811d5211fe9df341120882ba9994c7a61b897d7bf3fb662e53bc536"
-ADB_SHA256="214548146cadb2ca3508143d8a1d4be4c59de5bb837253e3ede89ed74cf450d1"
 BUILD="$ROOT/.build"
 ASSETS="$BUILD/assets"
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
-  x86_64) PACKAGE_ARCH=x86_64; ADB_BUNDLE=google ;;
-  aarch64|arm64) PACKAGE_ARCH=arm64; ADB_BUNDLE=system ;;
+  x86_64) PACKAGE_ARCH=x86_64 ;;
+  aarch64|arm64) PACKAGE_ARCH=arm64 ;;
   *) echo "Unsupported Linux architecture: $HOST_ARCH" >&2; exit 1 ;;
 esac
-TOOLS="$BUILD/platform-tools-linux-$PACKAGE_ARCH"
 OUT="$ROOT/dist/linux-$PACKAGE_ARCH"
 MESON_BUILD="$BUILD/scrcpy-linux-$PACKAGE_ARCH"
 
-for command in git go meson ninja pkg-config curl sha256sum unzip readelf ldd; do
+for command in git go meson ninja pkg-config curl sha256sum readelf ldd; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 1; }
 done
 
@@ -47,21 +44,8 @@ echo "$SCRCPY_SERVER_SHA256  $server" | sha256sum --check --status || {
   exit 1
 }
 
-rm -rf "$TOOLS" "$MESON_BUILD" "$OUT"
-mkdir -p "$TOOLS" "$OUT/lib"
-if [[ "$ADB_BUNDLE" == google ]]; then
-  adb_zip="$ASSETS/platform-tools_r$ADB_VERSION-linux.zip"
-  if [[ ! -f "$adb_zip" ]]; then
-    curl --fail --location --silent --show-error \
-      "https://dl.google.com/android/repository/platform-tools_r$ADB_VERSION-linux.zip" --output "$adb_zip"
-  fi
-  echo "$ADB_SHA256  $adb_zip" | sha256sum --check --status || { echo "Android Platform Tools checksum mismatch" >&2; exit 1; }
-  unzip -q "$adb_zip" -d "$TOOLS"
-  ADB_SOURCE="$TOOLS/platform-tools/adb"
-else
-  ADB_SOURCE="$(command -v adb || true)"
-  [[ -n "$ADB_SOURCE" ]] || { echo "Install system adb before building the ARM64 bundle." >&2; exit 1; }
-fi
+rm -rf "$MESON_BUILD" "$OUT"
+mkdir -p "$OUT/lib"
 
 pkg-config --exists 'libavformat >= 60.3' 'libavcodec >= 60.3' 'libavutil >= 58.2' libswresample 'sdl3 >= 3.2.0' || {
   echo "Install FFmpeg development libraries and SDL3 development files before building." >&2
@@ -77,16 +61,11 @@ meson setup "$MESON_BUILD" "$ROOT/third_party/scrcpy" \
 ninja -C "$MESON_BUILD"
 
 go build -trimpath -ldflags='-s -w' -o "$OUT/ags-android-capture" "$ROOT/cmd/ags-capture"
-install -m 755 "$ADB_SOURCE" "$OUT/adb"
 install -m 755 "$MESON_BUILD/app/scrcpy" "$OUT/scrcpy"
 install -m 644 "$server" "$OUT/scrcpy-server"
-if [[ -d "$TOOLS/platform-tools/lib64" ]]; then
-  cp -a "$TOOLS/platform-tools/lib64" "$OUT/"
-fi
 
 "$MESON_BUILD/app/scrcpy" --version >/dev/null
 
-"$OUT/adb" version >/dev/null
 "$OUT/scrcpy" --version >/dev/null
 install -m 755 "$ROOT/scripts/install-linux.sh" "$OUT/install.sh"
 install -m 644 "$ROOT/README.md" "$OUT/README.md"

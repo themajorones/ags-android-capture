@@ -3,16 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRCPY_VERSION="5.0.1"
-ADB_VERSION="37.0.3"
 SCRCPY_SERVER_SHA256="764eb6f79811d5211fe9df341120882ba9994c7a61b897d7bf3fb662e53bc536"
-ADB_SHA256="89d108360a3bf2924d3bea837239edaccc22fd6ff5befd3787c4348a9fe4f09d"
 BUILD="$ROOT/.build"
 ASSETS="$BUILD/assets"
-TOOLS="$BUILD/platform-tools-win"
 OUT="$ROOT/dist/windows-x86_64"
 MESON_BUILD="$BUILD/scrcpy-windows"
 
-for command in git go meson ninja pkg-config curl sha256sum unzip; do
+for command in git go meson ninja pkg-config curl sha256sum ldd; do
   command -v "$command" >/dev/null || { echo "Missing required command: $command" >&2; exit 1; }
 done
 
@@ -33,20 +30,11 @@ if [[ ! -f "$server" ]]; then
 fi
 echo "$SCRCPY_SERVER_SHA256  $server" | sha256sum --check --status || { echo "scrcpy server checksum mismatch" >&2; exit 1; }
 
-adb_zip="$ASSETS/platform-tools_r$ADB_VERSION-win.zip"
-if [[ ! -f "$adb_zip" ]]; then
-  curl --fail --location --silent --show-error \
-    "https://dl.google.com/android/repository/platform-tools_r$ADB_VERSION-win.zip" \
-    --output "$adb_zip"
-fi
-echo "$ADB_SHA256  $adb_zip" | sha256sum --check --status || { echo "Android Platform Tools checksum mismatch" >&2; exit 1; }
-
-rm -rf "$TOOLS" "$MESON_BUILD" "$OUT"
-mkdir -p "$TOOLS" "$OUT"
-unzip -q "$adb_zip" -d "$TOOLS"
+rm -rf "$MESON_BUILD" "$OUT"
+mkdir -p "$OUT"
 
 pkg-config --exists 'libavformat >= 60.3' 'libavcodec >= 60.3' 'libavutil >= 58.2' libswresample 'sdl3 >= 3.2.0' || {
-  echo "Install the scrcpy MSYS2 MINGW64 FFmpeg and SDL3 packages before building." >&2
+  echo "Install the scrcpy MSYS2 UCRT64 or MINGW64 FFmpeg and SDL3 packages before building." >&2
   exit 1
 }
 
@@ -59,14 +47,34 @@ meson setup "$MESON_BUILD" "$ROOT/third_party/scrcpy" \
 ninja -C "$MESON_BUILD"
 
 go build -trimpath -ldflags='-s -w' -o "$OUT/ags-android-capture.exe" "$ROOT/cmd/ags-capture"
-cp "$TOOLS/platform-tools/adb.exe" "$OUT/adb.exe"
-cp "$TOOLS/platform-tools/AdbWinApi.dll" "$TOOLS/platform-tools/AdbWinUsbApi.dll" "$OUT/"
 cp "$MESON_BUILD/app/scrcpy.exe" "$OUT/scrcpy.exe"
 cp "$server" "$OUT/scrcpy-server"
 
 # MSYS2 runtime DLLs are required beside scrcpy.exe on a clean Windows install.
-ldd "$OUT/scrcpy.exe" | awk '$3 ~ /^\/mingw64\/bin\/.*\.dll$/ { print $3 }' | sort -u | while read -r dll; do
-  cp -n "$dll" "$OUT/"
+# The CI toolchain is UCRT64; also accept MINGW64 for local builds. The previous
+# filter only matched MINGW64, so CI silently produced bundles missing every
+# FFmpeg/SDL runtime DLL and scrcpy exited with STATUS_DLL_NOT_FOUND.
+ldd_output="$(ldd "$OUT/scrcpy.exe")"
+if grep -Eqi 'not found' <<< "$ldd_output"; then
+  printf '%s\n' "$ldd_output" >&2
+  echo "scrcpy has unresolved Windows runtime dependencies." >&2
+  exit 1
+fi
+runtime_dlls="$(awk '$2 == "=>" && $3 ~ /\/(ucrt64|mingw64)\/bin\/[^[:space:]]+\.dll$/ { print $3 }' <<< "$ldd_output" | sort -u)"
+if [[ -z "$runtime_dlls" ]]; then
+  printf '%s\n' "$ldd_output" >&2
+  echo "Could not locate scrcpy runtime DLLs under the active MSYS2 environment." >&2
+  exit 1
+fi
+while IFS= read -r dll; do
+  [[ -n "$dll" ]] && cp -n "$dll" "$OUT/"
+done <<< "$runtime_dlls"
+
+for pattern in SDL3.dll avcodec-*.dll avformat-*.dll avutil-*.dll; do
+  compgen -G "$OUT/$pattern" >/dev/null || {
+    echo "The Windows bundle is missing required scrcpy runtime dependency: $pattern" >&2
+    exit 1
+  }
 done
 
 "$OUT/ags-android-capture.exe" 2>&1 | grep -q '^usage:' || true

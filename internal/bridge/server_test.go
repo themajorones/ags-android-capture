@@ -42,7 +42,7 @@ func TestHealthReportsIdleBridge(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d", response.Code)
 	}
-	if got := response.Body.String(); got == "" || !strings.Contains(got, `"status":"ok"`) || !strings.Contains(got, `"streamActive":false`) {
+	if got := response.Body.String(); got == "" || !strings.Contains(got, `"status":"ok"`) || !strings.Contains(got, `"streamActive":false`) || !strings.Contains(got, `"streamCount":0`) {
 		t.Fatalf("unexpected health response: %s", got)
 	}
 }

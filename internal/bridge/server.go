@@ -20,17 +20,20 @@ type Config struct {
 }
 
 type Server struct {
-	config  Config
-	mu      sync.Mutex
-	startMu sync.Mutex
-	active  *streamSession
-	last    time.Time
+	config       Config
+	mu           sync.Mutex
+	streams      map[*streamSession]struct{}
+	deviceStarts map[string]*deviceStartGate
+	last         time.Time
 }
 
 type streamSession struct {
 	serial string
-	cancel context.CancelFunc
-	done   chan struct{}
+}
+
+type deviceStartGate struct {
+	token chan struct{}
+	users int
 }
 
 func New(config Config) *Server {
@@ -40,14 +43,61 @@ func New(config Config) *Server {
 	if config.SessionWaitTime <= 0 {
 		config.SessionWaitTime = 20 * time.Second
 	}
-	return &Server{config: config, last: time.Now()}
+	return &Server{
+		config:       config,
+		streams:      make(map[*streamSession]struct{}),
+		deviceStarts: make(map[string]*deviceStartGate),
+		last:         time.Now(),
+	}
+}
+
+// Serialize only scrcpy startup for a given device. Concurrent startup pushes
+// the same server archive path on Android and can make app_process launch a
+// partially replaced jar; once the first stream header arrives, both streams
+// may run independently.
+func (s *Server) acquireDeviceStartup(ctx context.Context, serial string) (func(), error) {
+	s.mu.Lock()
+	gate := s.deviceStarts[serial]
+	if gate == nil {
+		gate = &deviceStartGate{token: make(chan struct{}, 1)}
+		gate.token <- struct{}{}
+		s.deviceStarts[serial] = gate
+	}
+	gate.users++
+	s.mu.Unlock()
+
+	releaseUser := func() {
+		s.mu.Lock()
+		gate.users--
+		if gate.users == 0 && s.deviceStarts[serial] == gate {
+			delete(s.deviceStarts, serial)
+		}
+		s.mu.Unlock()
+	}
+	select {
+	case <-ctx.Done():
+		releaseUser()
+		return nil, ctx.Err()
+	case <-gate.token:
+		if err := ctx.Err(); err != nil {
+			gate.token <- struct{}{}
+			releaseUser()
+			return nil, err
+		}
+		return func() {
+			gate.token <- struct{}{}
+			releaseUser()
+		}, nil
+	}
 }
 
 func (s *Server) Health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	streamCount := s.activeStreamCount()
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":       "ok",
-		"streamActive": s.isActive(),
+		"streamActive": streamCount > 0,
+		"streamCount":  streamCount,
 		"streamMode":   "local scrcpy packets",
 	})
 }
@@ -65,8 +115,8 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// The exact Origin allowlist was checked above. Disable the library's
-		// host-only check so AGS may run behind a different host name.
+		// The helper intentionally accepts AGS pages from any host. Disable the
+		// library's host-only check so machine-specific hostnames work.
 		InsecureSkipVerify: true,
 		CompressionMode:    websocket.CompressionDisabled,
 	})
@@ -78,56 +128,35 @@ func (s *Server) Stream(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	session := &streamSession{serial: request.serial, cancel: cancel, done: make(chan struct{})}
-
-	// A browser can reconnect before its previous WebSocket has cleaned up.
-	// Serialize ownership changes, cancel the current stream, and wait for its
-	// scrcpy process and private ADB server to be reaped before starting another.
-	s.startMu.Lock()
+	session := &streamSession{serial: request.serial}
 	s.mu.Lock()
-	previous := s.active
-	if previous != nil {
-		previous.cancel()
-	}
-	s.mu.Unlock()
-	if previous != nil {
-		log.Printf("replacing local stream for %s with request for %s", previous.serial, request.serial)
-		select {
-		case <-previous.done:
-		case <-ctx.Done():
-			s.startMu.Unlock()
-			return
-		}
-	}
-	if ctx.Err() != nil {
-		s.startMu.Unlock()
-		return
-	}
-	s.mu.Lock()
-	s.active = session
+	s.streams[session] = struct{}{}
 	s.last = time.Now()
+	activeStreams := len(s.streams)
 	s.mu.Unlock()
-	s.startMu.Unlock()
+	log.Printf("browser stream started for %s (active streams: %d)", request.serial, activeStreams)
 	defer func() {
+		cancel()
 		s.mu.Lock()
-		if s.active == session {
-			s.active = nil
-			s.last = time.Now()
-		}
+		delete(s.streams, session)
+		s.last = time.Now()
+		activeStreams := len(s.streams)
 		s.mu.Unlock()
-		close(session.done)
+		log.Printf("browser stream closed for %s (active streams: %d)", request.serial, activeStreams)
 	}()
 
 	if err := s.runStream(ctx, conn, request); err != nil && ctx.Err() == nil {
 		log.Printf("device stream ended: %v", err)
-		_ = conn.Close(websocket.StatusInternalError, "device stream ended")
+		failure, _ := json.Marshal(map[string]string{"kind": "error", "message": err.Error()})
+		_ = writeWebSocket(ctx, conn, websocket.MessageText, failure)
+		_ = conn.Close(websocket.StatusInternalError, "device stream failed")
 	}
 }
 
-func (s *Server) isActive() bool {
+func (s *Server) activeStreamCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.active != nil
+	return len(s.streams)
 }
 
 func (s *Server) originAllowed(origin string) bool {
@@ -135,7 +164,7 @@ func (s *Server) originAllowed(origin string) bool {
 		return false
 	}
 	for _, allowed := range s.config.AllowedOrigins {
-		if origin == allowed {
+		if allowed == "*" || origin == allowed {
 			return true
 		}
 	}
@@ -154,7 +183,7 @@ func (s *Server) ExitWhenIdle(ctx context.Context, server *http.Server) {
 			return
 		case <-ticker.C:
 			s.mu.Lock()
-			idle := s.active == nil && time.Since(s.last) >= s.config.IdleTimeout
+			idle := len(s.streams) == 0 && time.Since(s.last) >= s.config.IdleTimeout
 			s.mu.Unlock()
 			if idle {
 				log.Print("no local stream requested; stopping the per-user bridge")
