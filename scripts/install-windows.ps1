@@ -1,23 +1,26 @@
+param([string]$BundlePath)
+
 $ErrorActionPreference = 'Stop'
 
 trap {
     Write-Host ''
     Write-Host 'AGS Android Capture installation failed:' -ForegroundColor Red
     Write-Host ($_ | Format-List * -Force | Out-String) -ForegroundColor Red
-    Read-Host 'Press Enter to close this window'
+    Read-Host 'Press Enter to close this window' | Out-Null
     exit 1
 }
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (Test-Path (Join-Path $ScriptDir 'ags-android-capture.exe')) {
-    $Source = $ScriptDir
+if ($BundlePath) {
+    $Source = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BundlePath)
+} elseif (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'ags-android-capture.exe') -PathType Leaf) {
+    $Source = $PSScriptRoot
 } else {
-    $Root = Split-Path -Parent $ScriptDir
+    $Root = Split-Path -Parent $PSScriptRoot
     $Source = Join-Path $Root 'dist\windows-x86_64'
 }
 $Destination = Join-Path $env:LOCALAPPDATA 'AGS\AndroidCapture'
-if (-not (Test-Path (Join-Path $Source 'ags-android-capture.exe'))) {
-    throw 'Build or download the complete Windows bundle first. Local builds use the MSYS2 UCRT64 or MINGW64 environment.'
+if (-not (Test-Path -LiteralPath (Join-Path $Source 'ags-android-capture.exe') -PathType Leaf)) {
+    throw "No ags-android-capture.exe found in '$Source'. Build the Windows bundle with MSYS2 UCRT64 or MINGW64, or pass -BundlePath with the path to an extracted Windows bundle."
 }
 $SystemADB = Get-Command adb -ErrorAction SilentlyContinue
 if (-not $SystemADB) {
@@ -30,7 +33,7 @@ if ($LASTEXITCODE -ne 0) {
 
 $ScrcpyPath = Join-Path $Source 'scrcpy.exe'
 foreach ($Pattern in @('SDL3.dll', 'avcodec-*.dll', 'avformat-*.dll', 'avutil-*.dll')) {
-    if (-not (Get-ChildItem -Path $Source -Filter $Pattern -File -ErrorAction SilentlyContinue)) {
+    if (-not (Get-ChildItem -LiteralPath $Source -Filter $Pattern -File -ErrorAction SilentlyContinue)) {
         throw "The Windows bundle is incomplete: scrcpy runtime dependency '$Pattern' is missing. Download or rebuild the complete bundle."
     }
 }
@@ -59,6 +62,9 @@ if ($CaptureTask -and $CaptureTask.State -eq 'Running') {
         Start-Sleep -Milliseconds 200
         $CaptureTask = Get-ScheduledTask -TaskName 'AGS Android Capture' -ErrorAction SilentlyContinue
     } while ($CaptureTask -and $CaptureTask.State -eq 'Running' -and (Get-Date) -lt $TaskStopDeadline)
+    if ($CaptureTask -and $CaptureTask.State -eq 'Running') {
+        throw 'The AGS Android Capture scheduled task did not stop within 10 seconds. Close it before retrying installation.'
+    }
 }
 
 $InstalledProcesses = Get-CimInstance Win32_Process -Filter "name = 'ags-android-capture.exe'" |
@@ -79,7 +85,7 @@ foreach ($CaptureProcess in $InstalledProcesses) {
     }
 }
 
-Get-ChildItem -Path $Source -File | Where-Object { $_.Name -notin @('install.ps1', 'README.md') } | Copy-Item -Destination $Destination -Force
+Get-ChildItem -LiteralPath $Source -File | Where-Object { $_.Name -notin @('install.ps1', 'install.cmd', 'README.md') } | Copy-Item -Destination $Destination -Force
 Remove-Item -Path (Join-Path $Destination 'adb.exe'), (Join-Path $Destination 'AdbWinApi.dll'), (Join-Path $Destination 'AdbWinUsbApi.dll') -Force -ErrorAction SilentlyContinue
 
 $StartScript = Join-Path $Destination 'start-ags-capture.ps1'
@@ -100,6 +106,27 @@ $StartScriptContent | Set-Content -Encoding UTF8 $StartScript
 
 $TaskAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$StartScript`""
 $TaskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-Register-ScheduledTask -TaskName 'AGS Android Capture' -Action $TaskAction -Trigger $TaskTrigger -Description 'Starts the local AGS browser bridge; adb and scrcpy run only when a stream is requested.' -Force | Out-Null
+$TaskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName 'AGS Android Capture' -Action $TaskAction -Trigger $TaskTrigger -Settings $TaskSettings -Description 'Starts the local AGS browser bridge; adb and scrcpy run only when a stream is requested.' -Force | Out-Null
 Start-ScheduledTask -TaskName 'AGS Android Capture'
+
+$HealthDeadline = (Get-Date).AddSeconds(15)
+$BridgeReady = $false
+do {
+    try {
+        $Health = Invoke-RestMethod -Uri 'http://127.0.0.1:17653/healthz' -TimeoutSec 2 -ErrorAction Stop
+        $BridgeReady = $Health.status -eq 'ok' -and $Health.streamMode -eq 'local scrcpy packets'
+    } catch {
+        $BridgeReady = $false
+    }
+    if (-not $BridgeReady) {
+        Start-Sleep -Milliseconds 300
+    }
+} until ($BridgeReady -or (Get-Date) -ge $HealthDeadline)
+
+if (-not $BridgeReady) {
+    $TaskResult = (Get-ScheduledTaskInfo -TaskName 'AGS Android Capture' -ErrorAction SilentlyContinue).LastTaskResult
+    throw "The bridge did not respond at http://127.0.0.1:17653/healthz after starting the scheduled task (last task result: $TaskResult). Check capture-*.stderr.log in '$Destination'."
+}
+
 Write-Host "Installed at $Destination. The bridge uses system ADB at $($SystemADB.Source) and listens on loopback; each ADB/scrcpy session starts only after the AGS page requests it."
