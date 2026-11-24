@@ -483,7 +483,7 @@ index 1eba9a8050172f3f2acf7a8654d507a439951af1..0782204c49d88d71ab6f603874d76e36
  
  extern const struct scrcpy_options scrcpy_options_default;
 diff --git a/app/src/scrcpy.c b/app/src/scrcpy.c
-index 0967e5dab2614dc030b4ef922e940318e1a1600f..47a6e5be65a22733f9881c660adcad51070f0ffb 100644
+index 0967e5da..94baeae7 100644
 --- a/app/src/scrcpy.c
 +++ b/app/src/scrcpy.c
 @@ -15,6 +15,7 @@
@@ -502,7 +502,24 @@ index 0967e5dab2614dc030b4ef922e940318e1a1600f..47a6e5be65a22733f9881c660adcad51
      struct sc_video_regulator video_regulator;
  #ifdef HAVE_V4L2
      struct sc_v4l2_sink v4l2_sink;
-@@ -450,6 +452,7 @@ scrcpy(struct scrcpy_options *options) {
+@@ -424,6 +426,16 @@ scrcpy(struct scrcpy_options *options) {
+     struct sc_acksync *acksync = NULL;
+ 
+     uint32_t scid = scrcpy_generate_scid();
++    if (options->ags_browser_stream) {
++        const char *requested_scid = getenv("AGS_SCRCPY_SCID");
++        if (requested_scid && *requested_scid) {
++            char *end;
++            unsigned long value = strtoul(requested_scid, &end, 16);
++            if (*end == '\0' && value <= 0x7FFFFFFFUL) {
++                scid = (uint32_t) value;
++            }
++        }
++    }
+ 
+     struct sc_server_params params = {
+         .scid = scid,
+@@ -450,6 +462,7 @@ scrcpy(struct scrcpy_options *options) {
          .capture_orientation = options->capture_orientation,
          .capture_orientation_lock = options->capture_orientation_lock,
          .control = options->control,
@@ -510,7 +527,7 @@ index 0967e5dab2614dc030b4ef922e940318e1a1600f..47a6e5be65a22733f9881c660adcad51
          .display_id = options->display_id,
          .new_display = options->new_display,
          .display_ime_policy = options->display_ime_policy,
-@@ -607,6 +610,12 @@ scrcpy(struct scrcpy_options *options) {
+@@ -607,6 +620,12 @@ scrcpy(struct scrcpy_options *options) {
                          set_recv_date, &video_demuxer_cbs, NULL);
      }
  
@@ -523,7 +540,7 @@ index 0967e5dab2614dc030b4ef922e940318e1a1600f..47a6e5be65a22733f9881c660adcad51
      if (options->audio) {
          static const struct sc_demuxer_callbacks audio_demuxer_cbs = {
              .on_ended = sc_audio_demuxer_on_ended,
-@@ -807,6 +816,13 @@ aoa_complete:
+@@ -807,6 +826,13 @@ aoa_complete:
              goto end;
          }
          controller_started = true;

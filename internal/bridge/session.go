@@ -3,7 +3,9 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,7 +43,6 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 	if err := parent.Err(); err != nil {
 		return err
 	}
-
 	args := []string{
 		"--serial", streamSerial,
 		"--video-bit-rate", strconv.Itoa(request.bitrate),
@@ -52,8 +53,12 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 	if request.maxSize > 0 {
 		args = append(args, "--max-size", strconv.Itoa(request.maxSize))
 	}
+	scrcpyID, err := newScrcpySessionID()
+	if err != nil {
+		return fmt.Errorf("create scrcpy session id: %w", err)
+	}
 	command := exec.Command(s.config.ScrcpyPath, args...)
-	command.Env = adbEnv
+	command.Env = withEnvironmentValue(adbEnv, "AGS_SCRCPY_SCID", scrcpyID)
 	configureProcessTree(command)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
@@ -69,6 +74,10 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 	}
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start scrcpy: %w", err)
+	}
+	stopStream := func() {
+		stopScrcpyServerByID(s.config.ADBPath, adbEnv, streamSerial, scrcpyID)
+		terminateProcessTree(command)
 	}
 	go func() {
 		_, _ = io.Copy(log.Writer(), io.LimitReader(stderr, 1<<20))
@@ -114,22 +123,22 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 	select {
 	case result := <-metadataResult:
 		if result.err != nil {
-			terminateProcessTree(command)
+			stopStream()
 			_ = command.Wait()
 			return fmt.Errorf("wait for scrcpy stream: %w", result.err)
 		}
 		if result.width == 0 || result.height == 0 {
-			terminateProcessTree(command)
+			stopStream()
 			_ = command.Wait()
 			return errors.New("scrcpy returned an empty video size")
 		}
 		streamWidth, streamHeight = result.width, result.height
 	case <-metadataTimer.C:
-		terminateProcessTree(command)
+		stopStream()
 		_ = command.Wait()
 		return errors.New("timed out waiting for the first Android video frame")
 	case <-parent.Done():
-		terminateProcessTree(command)
+		stopStream()
 		_ = command.Wait()
 		return parent.Err()
 	}
@@ -141,7 +150,7 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 		"codec": "h264", "transport": "scrcpy",
 	})
 	if err := writeWebSocket(parent, conn, websocket.MessageText, metadata); err != nil {
-		terminateProcessTree(command)
+		stopStream()
 		_ = command.Wait()
 		return err
 	}
@@ -161,9 +170,10 @@ func (s *Server) runStream(parent context.Context, conn *websocket.Conn, request
 		streamErr = parent.Err()
 	}
 	_ = stdin.Close()
-	// scrcpy starts adb shell as a child. Kill the whole process tree so an
-	// abandoned adb child cannot keep stdout open and strand the socket service.
-	terminateProcessTree(command)
+	// Stop the Android-side scrcpy process as well as the desktop process. If
+	// only the ADB/scrcpy process tree is killed, Android can keep its encoder
+	// server alive after Game View closes and interfere with later streams.
+	stopStream()
 	if !outputRead {
 		select {
 		case <-outputDone:
@@ -317,6 +327,110 @@ func runADB(ctx context.Context, executable string, env []string, args ...string
 	command.Stderr = &output
 	err := command.Run()
 	return output.String(), err
+}
+
+func newScrcpySessionID() (string, error) {
+	var value [4]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	value[0] &= 0x7f
+	return hex.EncodeToString(value[:]), nil
+}
+
+func withEnvironmentValue(environment []string, key, value string) []string {
+	entry := key + "=" + value
+	result := make([]string, 0, len(environment)+1)
+	for _, current := range environment {
+		currentKey, _, ok := strings.Cut(current, "=")
+		if ok && currentKey == key {
+			continue
+		}
+		result = append(result, current)
+	}
+	return append(result, entry)
+}
+
+func listScrcpyServerProcesses(ctx context.Context, adbPath string, env []string, serial, scrcpyID string) (map[string]string, error) {
+	commandCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	output, err := runADB(commandCtx, adbPath, env, "-s", serial, "shell", "ps", "-A", "-o", "PID,ARGS")
+	if err != nil {
+		return nil, fmt.Errorf("list Android scrcpy processes: %s: %w", strings.TrimSpace(output), err)
+	}
+
+	processes := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[0] == "PID" || fields[1] != "app_process" {
+			continue
+		}
+		if fields[2] != "/" || len(fields) < 4 || fields[3] != "com.genymobile.scrcpy.Server" {
+			continue
+		}
+		pid := fields[0]
+		if pid == "" || strings.Trim(pid, "0123456789") != "" {
+			continue
+		}
+		args := strings.Join(fields[1:], " ")
+		if strings.Contains(args, "scid="+scrcpyID) {
+			processes[pid] = args
+		}
+	}
+	return processes, nil
+}
+
+func stopScrcpyServerByID(adbPath string, env []string, serial, scrcpyID string) {
+	if len(scrcpyID) != 8 || strings.Trim(scrcpyID, "0123456789abcdefABCDEF") != "" {
+		log.Printf("invalid scrcpy session id from the video process on %s", serial)
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	current, err := listScrcpyServerProcesses(cleanupCtx, adbPath, env, serial, scrcpyID)
+	if err != nil {
+		log.Printf("could not find the Android scrcpy process to stop on %s: %v", serial, err)
+		return
+	}
+	var pids []string
+	for pid := range current {
+		pids = append(pids, pid)
+	}
+	if len(pids) == 0 {
+		return
+	}
+	sort.Strings(pids)
+	for _, pid := range pids {
+		if _, err := runADB(cleanupCtx, adbPath, env, "-s", serial, "shell", "kill", "-TERM", pid); err != nil {
+			log.Printf("could not stop Android scrcpy process %s on %s: %v", pid, serial, err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		current, err = listScrcpyServerProcesses(cleanupCtx, adbPath, env, serial, scrcpyID)
+		if err != nil {
+			log.Printf("could not verify Android scrcpy shutdown on %s: %v", serial, err)
+			return
+		}
+		remaining := false
+		for _, pid := range pids {
+			if _, alive := current[pid]; alive {
+				remaining = true
+				break
+			}
+		}
+		if !remaining {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for _, pid := range pids {
+		if _, alive := current[pid]; alive {
+			if _, err := runADB(cleanupCtx, adbPath, env, "-s", serial, "shell", "kill", "-KILL", pid); err != nil {
+				log.Printf("could not force stop Android scrcpy process %s on %s: %v", pid, serial, err)
+			}
+		}
+	}
 }
 
 func hasHostPort(serial string) bool {

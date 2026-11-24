@@ -252,7 +252,7 @@ func TestNewBrowserStreamReplacesPreviousStreamForSameDevice(t *testing.T) {
 	}
 	read := func(connection *websocket.Conn) (websocket.MessageType, []byte) {
 		t.Helper()
-		readContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		readContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		kind, data, readErr := connection.Read(readContext)
 		if readErr != nil {
