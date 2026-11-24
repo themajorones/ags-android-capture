@@ -15,8 +15,10 @@ done
 
 mkdir -p "$ASSETS"
 git -C "$ROOT" submodule update --init --recursive
+(cd "$ROOT/third_party/scrcpy" && git ls-files -z -- '*.c' '*.h' '*.build' | xargs -0 -r sed -i 's/\r$//')
 
-patch="$ROOT/patches/scrcpy-browser-stream.patch"
+patch="$BUILD/scrcpy-browser-stream.patch"
+tr -d '\r' < "$ROOT/patches/scrcpy-browser-stream.patch" > "$patch"
 if ! git -C "$ROOT/third_party/scrcpy" apply --reverse --check "$patch" >/dev/null 2>&1; then
   git -C "$ROOT/third_party/scrcpy" apply --check "$patch"
   git -C "$ROOT/third_party/scrcpy" apply "$patch"
